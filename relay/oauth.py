@@ -36,9 +36,13 @@ MAX_DCR_CLIENTS = 64
 MAX_INACTIVE_DCR_CLIENTS = 16
 INACTIVE_CLIENT_TTL_S = 60 * 60
 # In-memory pending authorize requests (pre-consent). Expired entries are swept
-# before admit; at capacity the oldest pending is evicted so churn cannot lock
-# out a legitimate ChatGPT authorize.
+# before admit. Per-client caps and fullest-client eviction keep one churning
+# client/source from displacing unrelated live consent prompts. A per-source
+# create rate limit further bounds unauthenticated authorize churn.
 MAX_PENDING_AUTHORIZATIONS = 32
+MAX_PENDING_PER_CLIENT = 4
+AUTHZ_RATE_LIMIT = 16
+AUTHZ_RATE_WINDOW_S = 60
 DCR_RATE_LIMIT = 8
 DCR_RATE_WINDOW_S = 15 * 60
 OWNER_FAIL_LIMIT = 5
@@ -219,6 +223,11 @@ class OAuthService:
         init=False,
         repr=False,
     )
+    _authz_limiter: _SlidingWindow = field(
+        default_factory=lambda: _SlidingWindow(AUTHZ_RATE_LIMIT, AUTHZ_RATE_WINDOW_S),
+        init=False,
+        repr=False,
+    )
     _owner_fail_limiter: _SlidingWindow = field(
         default_factory=lambda: _SlidingWindow(OWNER_FAIL_LIMIT, OWNER_FAIL_WINDOW_S),
         init=False,
@@ -342,6 +351,12 @@ class OAuthService:
                 return True
         return False
 
+    def _client_has_live_pending_locked(self, client_id: str, *, now: float) -> bool:
+        for pending in self.pending.values():
+            if pending.client_id == client_id and pending.expires_at >= now:
+                return True
+        return False
+
     def _remove_client_locked(self, client_id: str) -> None:
         stale = [
             tid
@@ -352,11 +367,20 @@ class OAuthService:
             del self.refresh_tokens[tid]
         self.clients.pop(client_id, None)
 
+    def _inactive_occupancy_locked(self, *, now: float) -> int:
+        return sum(
+            1
+            for cid in self.clients
+            if not self._client_has_live_refresh(cid, now=now)
+        )
+
     def _inactive_clients_locked(self, *, now: float) -> list[RegisteredClient]:
+        """Inactive clients eligible for eviction (no live refresh, no live pending)."""
         inactive = [
             c
             for c in self.clients.values()
             if not self._client_has_live_refresh(c.client_id, now=now)
+            and not self._client_has_live_pending_locked(c.client_id, now=now)
         ]
         inactive.sort(key=lambda c: (c.issued_at, c.last_used_at, c.client_id))
         return inactive
@@ -364,9 +388,11 @@ class OAuthService:
     def _cleanup_inactive_clients_locked(
         self, *, now: float, reserve_slots: int = 0
     ) -> list[str]:
-        """Evict unactivated/inactive DCR clients; never touch live-refresh clients.
+        """Evict unactivated/inactive DCR clients; never touch live-refresh or live-pending.
 
         ``reserve_slots`` leaves room for an incoming registration (typically 1).
+        Clients referenced by an unexpired pending authorization are retained so
+        an open consent page cannot be broken by ordinary DCR cleanup.
         """
         if reserve_slots < 0:
             raise ValueError("reserve_slots must be >= 0")
@@ -375,6 +401,8 @@ class OAuthService:
         # Short TTL for clients that never received (or no longer have) a live refresh.
         for client in list(self.clients.values()):
             if self._client_has_live_refresh(client.client_id, now=now):
+                continue
+            if self._client_has_live_pending_locked(client.client_id, now=now):
                 continue
             if (now - client.last_used_at) < INACTIVE_CLIENT_TTL_S:
                 continue
@@ -385,7 +413,8 @@ class OAuthService:
         total_budget = max(0, MAX_DCR_CLIENTS - reserve_slots)
         while True:
             inactive = self._inactive_clients_locked(now=now)
-            over_inactive = len(inactive) > inactive_budget
+            # Occupancy includes pending-protected clients that cannot be evicted.
+            over_inactive = self._inactive_occupancy_locked(now=now) > inactive_budget
             over_total = len(self.clients) > total_budget
             if not over_inactive and not over_total:
                 break
@@ -396,10 +425,52 @@ class OAuthService:
             evicted.append(victim.client_id)
         return evicted
 
-    def _cleanup_pending_locked(self, *, now: float, reserve_slots: int = 0) -> list[str]:
-        """Sweep expired pending authorizations; evict oldest when over capacity.
+    def _pending_count_for_client_locked(self, client_id: str) -> int:
+        return sum(1 for p in self.pending.values() if p.client_id == client_id)
+
+    def _evict_oldest_pending_for_client_locked(self, client_id: str) -> str | None:
+        candidates = [
+            (request_id, pending)
+            for request_id, pending in self.pending.items()
+            if pending.client_id == client_id
+        ]
+        if not candidates:
+            return None
+        oldest_id = min(candidates, key=lambda item: (item[1].expires_at, item[0]))[0]
+        del self.pending[oldest_id]
+        return oldest_id
+
+    def _evict_fullest_pending_locked(self) -> str | None:
+        """Evict oldest pending among clients holding the most live pending slots."""
+        if not self.pending:
+            return None
+        counts: dict[str, int] = {}
+        for pending in self.pending.values():
+            counts[pending.client_id] = counts.get(pending.client_id, 0) + 1
+        max_count = max(counts.values())
+        candidates = [
+            (request_id, pending)
+            for request_id, pending in self.pending.items()
+            if counts[pending.client_id] == max_count
+        ]
+        oldest_id = min(candidates, key=lambda item: (item[1].expires_at, item[0]))[0]
+        del self.pending[oldest_id]
+        return oldest_id
+
+    def _cleanup_pending_locked(
+        self,
+        *,
+        now: float,
+        reserve_slots: int = 0,
+        for_client_id: str | None = None,
+    ) -> list[str]:
+        """Sweep expired pending; enforce per-client and global bounds.
 
         ``reserve_slots`` leaves room for an incoming authorize (typically 1).
+        When ``for_client_id`` is set, that client's own pending is trimmed to
+        ``MAX_PENDING_PER_CLIENT - reserve_slots`` before global eviction.
+        Global overflow evicts from the fullest clients first so one churning
+        client cannot displace an unrelated live consent prompt.
         Pending state is in-memory only and is never written to durable store.
         """
         if reserve_slots < 0:
@@ -409,14 +480,21 @@ class OAuthService:
             if pending.expires_at < now:
                 del self.pending[request_id]
                 removed.append(request_id)
+
+        if for_client_id is not None:
+            per_client_budget = max(0, MAX_PENDING_PER_CLIENT - reserve_slots)
+            while self._pending_count_for_client_locked(for_client_id) > per_client_budget:
+                victim = self._evict_oldest_pending_for_client_locked(for_client_id)
+                if victim is None:
+                    break
+                removed.append(victim)
+
         budget = max(0, MAX_PENDING_AUTHORIZATIONS - reserve_slots)
         while len(self.pending) > budget:
-            oldest_id = min(
-                self.pending.items(),
-                key=lambda item: (item[1].expires_at, item[0]),
-            )[0]
-            del self.pending[oldest_id]
-            removed.append(oldest_id)
+            victim = self._evict_fullest_pending_locked()
+            if victim is None:
+                break
+            removed.append(victim)
         return removed
 
     @property
@@ -479,6 +557,20 @@ class OAuthService:
                     "oauth_dcr_clients_evicted",
                     reason="inactive_capacity",
                     count=len(evicted),
+                )
+            inactive_occupancy = self._inactive_occupancy_locked(now=now)
+            if inactive_occupancy >= MAX_INACTIVE_DCR_CLIENTS:
+                audit_event(
+                    _AUDIT_LOGGER,
+                    "oauth_dcr_registration_exhausted",
+                    reason="inactive_client_capacity",
+                    inactive_clients=inactive_occupancy,
+                    total_clients=len(self.clients),
+                )
+                raise OAuthError(
+                    "invalid_client_metadata",
+                    "client registration limit reached",
+                    status=400,
                 )
             if len(self.clients) >= MAX_DCR_CLIENTS:
                 audit_event(
@@ -569,7 +661,9 @@ class OAuthService:
             raise OAuthError("invalid_scope", "unsupported scope requested")
         return requested
 
-    def begin_authorization(self, params: dict[str, str]) -> PendingAuthorization | dict[str, str]:
+    def begin_authorization(
+        self, params: dict[str, str], *, source: str = "unknown"
+    ) -> PendingAuthorization | dict[str, str]:
         """Validate authorize query. Returns pending auth or error redirect params."""
         client_id = params.get("client_id", "")
         redirect_uri = params.get("redirect_uri", "")
@@ -624,11 +718,20 @@ class OAuthService:
             expires_at=time.time() + CODE_TTL_S,
         )
         with self._lock:
+            if not self._authz_limiter.allow(source):
+                raise OAuthError(
+                    "temporarily_unavailable",
+                    "authorization request rate limit exceeded",
+                    status=429,
+                )
             # Bound in-memory pending only. Do not touch last_used_at / durable
             # state here: authorize is unauthenticated and would amplify fsync
             # I/O while refreshing inactive-client TTL under churn.
-            self._cleanup_pending_locked(now=time.time(), reserve_slots=1)
+            self._cleanup_pending_locked(
+                now=time.time(), reserve_slots=1, for_client_id=client_id
+            )
             self.pending[request_id] = pending
+            self._authz_limiter.record(source)
         return pending
 
     def consent_html(self, pending: PendingAuthorization, error: str | None = None) -> str:

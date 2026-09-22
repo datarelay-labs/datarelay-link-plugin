@@ -60,6 +60,7 @@ class OAuthRelayTestCase(unittest.TestCase):
             "DRLINK_RELAY_AUTH_MODE": "oauth",
             "DRLINK_RELAY_PUBLIC_BASE_URL": self.public_base,
             "DRLINK_RELAY_OWNER_APPROVAL_SECRET": self.owner_secret,
+            "DRLINK_RELAY_OAUTH_ALLOW_EPHEMERAL": "1",
             # Intentionally set mock token; oauth mode must ignore it.
             "DRLINK_RELAY_MOCK_PLUGIN_TOKEN": "dev-plugin-token",
         }
@@ -683,7 +684,8 @@ class OAuthRelayTestCase(unittest.TestCase):
             },
         )
         self.assertEqual(status2, 401)
-        self.assertIn("invalid owner approval secret", str(html).lower())
+        self.assertIn("authorization denied", str(html).lower())
+        self.assertNotIn("invalid owner approval secret", str(html).lower())
         # Pending request still present; no code issued.
         self.assertIn(request_id, oauth.pending)
         self.assertFalse(oauth.codes)
@@ -731,19 +733,54 @@ class OAuthRelayTestCase(unittest.TestCase):
             )
 
     def test_oauth_mode_on_public_bind_without_mock_override(self) -> None:
-        cfg = load_config(
-            {
-                "DRLINK_RELAY_UPSTREAM_URL": f"http://127.0.0.1:{self.upstream_port}/mcp",
-                "DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM": "1",
-                "DRLINK_RELAY_AUTH_MODE": "oauth",
-                "DRLINK_RELAY_PUBLIC_BASE_URL": "https://relay.example",
-                "DRLINK_RELAY_OWNER_APPROVAL_SECRET": "owner-approval-secret-32chars!!",
-                "DRLINK_RELAY_BIND": "0.0.0.0",
-                "DRLINK_RELAY_PORT": str(_free_port()),
-            }
-        )
-        self.assertEqual(cfg.auth_mode, "oauth")
-        self.assertEqual(cfg.resource_url, "https://relay.example/mcp")
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "oauth-state.json")
+            cfg = load_config(
+                {
+                    "DRLINK_RELAY_UPSTREAM_URL": f"http://127.0.0.1:{self.upstream_port}/mcp",
+                    "DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM": "1",
+                    "DRLINK_RELAY_AUTH_MODE": "oauth",
+                    "DRLINK_RELAY_PUBLIC_BASE_URL": "https://relay.example",
+                    "DRLINK_RELAY_OWNER_APPROVAL_SECRET": "owner-approval-secret-32chars!!",
+                    "DRLINK_RELAY_OAUTH_STATE_PATH": state_path,
+                    "DRLINK_RELAY_BIND": "0.0.0.0",
+                    "DRLINK_RELAY_PORT": str(_free_port()),
+                }
+            )
+            self.assertEqual(cfg.auth_mode, "oauth")
+            self.assertEqual(cfg.resource_url, "https://relay.example/mcp")
+            self.assertEqual(cfg.oauth_state_path, state_path)
+
+    def test_public_oauth_requires_durable_state_path(self) -> None:
+        with self.assertRaises(ConfigError):
+            load_config(
+                {
+                    "DRLINK_RELAY_UPSTREAM_URL": f"http://127.0.0.1:{self.upstream_port}/mcp",
+                    "DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM": "1",
+                    "DRLINK_RELAY_AUTH_MODE": "oauth",
+                    "DRLINK_RELAY_PUBLIC_BASE_URL": "https://relay.example",
+                    "DRLINK_RELAY_OWNER_APPROVAL_SECRET": "owner-approval-secret-32chars!!",
+                    "DRLINK_RELAY_BIND": "0.0.0.0",
+                    "DRLINK_RELAY_PORT": "9",
+                }
+            )
+
+    def test_loopback_oauth_requires_ephemeral_or_state(self) -> None:
+        with self.assertRaises(ConfigError):
+            load_config(
+                {
+                    "DRLINK_RELAY_UPSTREAM_URL": f"http://127.0.0.1:{self.upstream_port}/mcp",
+                    "DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM": "1",
+                    "DRLINK_RELAY_AUTH_MODE": "oauth",
+                    "DRLINK_RELAY_PUBLIC_BASE_URL": "http://127.0.0.1:9",
+                    "DRLINK_RELAY_OWNER_APPROVAL_SECRET": "owner-approval-secret-32chars!!",
+                    "DRLINK_RELAY_BIND": "127.0.0.1",
+                    "DRLINK_RELAY_PORT": "9",
+                }
+            )
 
 
 if __name__ == "__main__":

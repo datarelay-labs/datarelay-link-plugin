@@ -1,8 +1,9 @@
-"""Single-user OAuth 2.1 authorization server + token validation (Packet 2 PoC).
+"""Single-user OAuth 2.1 authorization server + token validation.
 
 Built-in authorization server co-located with the MCP resource. Supports
 Authorization Code + PKCE S256, Dynamic Client Registration (public clients),
-resource indicators (RFC 8707), refresh-token rotation, and revocation.
+resource indicators (RFC 8707), refresh-token rotation, revocation, durable
+client/refresh state, and public-endpoint abuse controls.
 """
 
 from __future__ import annotations
@@ -10,20 +11,34 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import logging
 import secrets
 import threading
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
 
+from .audit import audit_event
 from .config import RelayConfig
+from .oauth_state import STATE_VERSION, DurableOAuthStore, OAuthStateError
+
+_AUDIT_LOGGER = logging.getLogger("drlink.relay")
 
 DEFAULT_SCOPE = "mcp:proxy"
 CODE_TTL_S = 60
 ACCESS_TTL_S = 3600
 REFRESH_TTL_S = 30 * 24 * 3600
 MAX_DCR_CLIENTS = 64
+# Unactivated DCR clients (no live refresh binding) are capped separately and
+# expire quickly so unauthenticated registration cannot lock out ChatGPT.
+MAX_INACTIVE_DCR_CLIENTS = 16
+INACTIVE_CLIENT_TTL_S = 60 * 60
+DCR_RATE_LIMIT = 8
+DCR_RATE_WINDOW_S = 15 * 60
+OWNER_FAIL_LIMIT = 5
+OWNER_FAIL_WINDOW_S = 15 * 60
 
 
 class OAuthError(Exception):
@@ -77,6 +92,7 @@ class RegisteredClient:
     grant_types: list[str]
     response_types: list[str]
     issued_at: int
+    last_used_at: float = 0.0
 
 
 @dataclass
@@ -128,8 +144,31 @@ class PendingAuthorization:
 
 
 @dataclass
+class _SlidingWindow:
+    max_events: int
+    window_s: float
+    _events: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
+
+    def allow(self, key: str, *, now: float | None = None) -> bool:
+        ts = time.time() if now is None else now
+        bucket = self._events[key]
+        cutoff = ts - self.window_s
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        return len(bucket) < self.max_events
+
+    def record(self, key: str, *, now: float | None = None) -> None:
+        ts = time.time() if now is None else now
+        bucket = self._events[key]
+        cutoff = ts - self.window_s
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        bucket.append(ts)
+
+
+@dataclass
 class OAuthService:
-    """In-memory single-user OAuth AS + RS validation store."""
+    """Single-user OAuth AS + RS validation with optional durable state."""
 
     config: RelayConfig
     clients: dict[str, RegisteredClient] = field(default_factory=dict)
@@ -138,6 +177,188 @@ class OAuthService:
     refresh_tokens: dict[str, RefreshToken] = field(default_factory=dict)
     pending: dict[str, PendingAuthorization] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock)
+    _store: DurableOAuthStore | None = field(default=None, init=False, repr=False)
+    _dcr_limiter: _SlidingWindow = field(
+        default_factory=lambda: _SlidingWindow(DCR_RATE_LIMIT, DCR_RATE_WINDOW_S),
+        init=False,
+        repr=False,
+    )
+    _owner_fail_limiter: _SlidingWindow = field(
+        default_factory=lambda: _SlidingWindow(OWNER_FAIL_LIMIT, OWNER_FAIL_WINDOW_S),
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.config.oauth_state_path:
+            self._store = DurableOAuthStore(self.config.oauth_state_path)
+            payload = self._store.load()
+            self._load_payload(payload)
+            # Persist TTL cleanup so expired inactive clients do not resurrect.
+            with self._lock:
+                evicted = self._cleanup_inactive_clients_locked(now=time.time(), reserve_slots=0)
+                if evicted:
+                    self._persist_locked()
+                    audit_event(
+                        _AUDIT_LOGGER,
+                        "oauth_dcr_clients_evicted",
+                        reason="inactive_ttl_on_load",
+                        count=len(evicted),
+                    )
+
+    def _load_payload(self, payload: dict[str, Any]) -> None:
+        clients_raw = payload.get("clients") or {}
+        refresh_raw = payload.get("refresh_tokens") or {}
+        for key, value in clients_raw.items():
+            if not isinstance(value, dict):
+                raise OAuthStateError("invalid durable client record")
+            try:
+                client = RegisteredClient(
+                    client_id=str(value["client_id"]),
+                    redirect_uris=list(value["redirect_uris"]),
+                    client_name=value.get("client_name"),
+                    token_endpoint_auth_method=str(
+                        value.get("token_endpoint_auth_method", "none")
+                    ),
+                    grant_types=list(
+                        value.get("grant_types") or ["authorization_code", "refresh_token"]
+                    ),
+                    response_types=list(value.get("response_types") or ["code"]),
+                    issued_at=int(value["issued_at"]),
+                    last_used_at=float(value.get("last_used_at") or value["issued_at"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise OAuthStateError("invalid durable client record") from exc
+            if client.client_id != key:
+                raise OAuthStateError("durable client_id mismatch")
+            self.clients[key] = client
+        for key, value in refresh_raw.items():
+            if not isinstance(value, dict):
+                raise OAuthStateError("invalid durable refresh token record")
+            try:
+                token = RefreshToken(
+                    token=str(value["token"]),
+                    client_id=str(value["client_id"]),
+                    resource=str(value["resource"]),
+                    scopes=frozenset(str(s) for s in (value.get("scopes") or [])),
+                    expires_at=float(value["expires_at"]),
+                    revoked=bool(value.get("revoked", False)),
+                    subject=str(value.get("subject") or "relay-owner"),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise OAuthStateError("invalid durable refresh token record") from exc
+            if token.token != key:
+                raise OAuthStateError("durable refresh token key mismatch")
+            self.refresh_tokens[key] = token
+
+    def _persist_locked(self) -> None:
+        if self._store is None:
+            return
+        now = time.time()
+        # Drop expired refresh records from durable storage after TTL.
+        expired = [
+            tid
+            for tid, tok in self.refresh_tokens.items()
+            if tok.expires_at < now and tok.revoked
+        ]
+        for tid in expired:
+            del self.refresh_tokens[tid]
+        payload = {
+            "version": STATE_VERSION,
+            "clients": {
+                cid: {
+                    "client_id": c.client_id,
+                    "redirect_uris": list(c.redirect_uris),
+                    "client_name": c.client_name,
+                    "token_endpoint_auth_method": c.token_endpoint_auth_method,
+                    "grant_types": list(c.grant_types),
+                    "response_types": list(c.response_types),
+                    "issued_at": c.issued_at,
+                    "last_used_at": c.last_used_at,
+                }
+                for cid, c in self.clients.items()
+            },
+            "refresh_tokens": {
+                tid: {
+                    "token": t.token,
+                    "client_id": t.client_id,
+                    "resource": t.resource,
+                    "scopes": sorted(t.scopes),
+                    "expires_at": t.expires_at,
+                    "revoked": t.revoked,
+                    "subject": t.subject,
+                }
+                for tid, t in self.refresh_tokens.items()
+            },
+        }
+        try:
+            self._store.save(payload)
+        except OAuthStateError as exc:
+            raise OAuthError("server_error", str(exc), status=500) from exc
+
+    def _client_has_live_refresh(self, client_id: str, *, now: float) -> bool:
+        for token in self.refresh_tokens.values():
+            if (
+                token.client_id == client_id
+                and not token.revoked
+                and token.expires_at >= now
+            ):
+                return True
+        return False
+
+    def _remove_client_locked(self, client_id: str) -> None:
+        stale = [
+            tid
+            for tid, tok in self.refresh_tokens.items()
+            if tok.client_id == client_id
+        ]
+        for tid in stale:
+            del self.refresh_tokens[tid]
+        self.clients.pop(client_id, None)
+
+    def _inactive_clients_locked(self, *, now: float) -> list[RegisteredClient]:
+        inactive = [
+            c
+            for c in self.clients.values()
+            if not self._client_has_live_refresh(c.client_id, now=now)
+        ]
+        inactive.sort(key=lambda c: (c.issued_at, c.last_used_at, c.client_id))
+        return inactive
+
+    def _cleanup_inactive_clients_locked(
+        self, *, now: float, reserve_slots: int = 0
+    ) -> list[str]:
+        """Evict unactivated/inactive DCR clients; never touch live-refresh clients.
+
+        ``reserve_slots`` leaves room for an incoming registration (typically 1).
+        """
+        if reserve_slots < 0:
+            raise ValueError("reserve_slots must be >= 0")
+        evicted: list[str] = []
+
+        # Short TTL for clients that never received (or no longer have) a live refresh.
+        for client in list(self.clients.values()):
+            if self._client_has_live_refresh(client.client_id, now=now):
+                continue
+            if (now - client.last_used_at) < INACTIVE_CLIENT_TTL_S:
+                continue
+            self._remove_client_locked(client.client_id)
+            evicted.append(client.client_id)
+
+        inactive_budget = max(0, MAX_INACTIVE_DCR_CLIENTS - reserve_slots)
+        total_budget = max(0, MAX_DCR_CLIENTS - reserve_slots)
+        while True:
+            inactive = self._inactive_clients_locked(now=now)
+            over_inactive = len(inactive) > inactive_budget
+            over_total = len(self.clients) > total_budget
+            if not over_inactive and not over_total:
+                break
+            if not inactive:
+                break
+            victim = inactive[0]
+            self._remove_client_locked(victim.client_id)
+            evicted.append(victim.client_id)
+        return evicted
 
     @property
     def issuer(self) -> str:
@@ -181,9 +402,37 @@ class OAuthService:
             "client_id_metadata_document_supported": False,
         }
 
-    def register_client(self, body: dict[str, Any]) -> dict[str, Any]:
+    def register_client(
+        self, body: dict[str, Any], *, source: str = "unknown"
+    ) -> dict[str, Any]:
         with self._lock:
+            if not self._dcr_limiter.allow(source):
+                raise OAuthError(
+                    "temporarily_unavailable",
+                    "client registration rate limit exceeded",
+                    status=429,
+                )
+            now = time.time()
+            evicted = self._cleanup_inactive_clients_locked(now=now, reserve_slots=1)
+            if evicted:
+                audit_event(
+                    _AUDIT_LOGGER,
+                    "oauth_dcr_clients_evicted",
+                    reason="inactive_capacity",
+                    count=len(evicted),
+                )
             if len(self.clients) >= MAX_DCR_CLIENTS:
+                audit_event(
+                    _AUDIT_LOGGER,
+                    "oauth_dcr_registration_exhausted",
+                    reason="active_client_capacity",
+                    active_clients=sum(
+                        1
+                        for cid in self.clients
+                        if self._client_has_live_refresh(cid, now=now)
+                    ),
+                    total_clients=len(self.clients),
+                )
                 raise OAuthError(
                     "invalid_client_metadata",
                     "client registration limit reached",
@@ -227,7 +476,7 @@ class OAuthService:
                 raise OAuthError("invalid_client_metadata", "only response_type=code", status=400)
 
             client_id = _new_token("client")
-            issued_at = int(time.time())
+            issued_at = int(now)
             name = body.get("client_name")
             client = RegisteredClient(
                 client_id=client_id,
@@ -237,8 +486,11 @@ class OAuthService:
                 grant_types=list(grant_types),
                 response_types=["code"],
                 issued_at=issued_at,
+                last_used_at=now,
             )
             self.clients[client_id] = client
+            self._dcr_limiter.record(source, now=now)
+            self._persist_locked()
             return {
                 "client_id": client_id,
                 "client_id_issued_at": issued_at,
@@ -283,10 +535,10 @@ class OAuthService:
 
         with self._lock:
             client = self.clients.get(client_id)
-        if client is None:
-            raise OAuthError("unauthorized_client", "unknown client_id")
-        if not _exact_redirect_allowed(client.redirect_uris, redirect_uri):
-            raise OAuthError("invalid_request", "redirect_uri mismatch")
+            if client is None:
+                raise OAuthError("unauthorized_client", "unknown client_id")
+            if not _exact_redirect_allowed(client.redirect_uris, redirect_uri):
+                raise OAuthError("invalid_request", "redirect_uri mismatch")
         if response_type != "code":
             return error_redirect("unsupported_response_type", "only code is supported")  # type: ignore[return-value]
         if method != "S256":
@@ -313,7 +565,9 @@ class OAuthService:
             expires_at=time.time() + CODE_TTL_S,
         )
         with self._lock:
+            client.last_used_at = time.time()
             self.pending[request_id] = pending
+            self._persist_locked()
         return pending
 
     def consent_html(self, pending: PendingAuthorization, error: str | None = None) -> str:
@@ -343,7 +597,12 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
 </body></html>"""
 
     def complete_authorization(
-        self, *, request_id: str, owner_secret: str, decision: str
+        self,
+        *,
+        request_id: str,
+        owner_secret: str,
+        decision: str,
+        source: str = "unknown",
     ) -> str:
         """Return redirect Location URL after owner decision."""
         with self._lock:
@@ -368,12 +627,22 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
                 {"error": "access_denied", "error_description": "owner denied authorization"}
             )
 
-        expected = self.config.owner_approval_secret or ""
-        if not expected or not secrets.compare_digest(owner_secret, expected):
-            # Re-queue so a typo does not burn the request; recreate pending.
-            with self._lock:
+        # Uniform denial message: do not leak lockout vs wrong-secret vs prefix guesses.
+        denial = "authorization denied"
+        with self._lock:
+            if not self._owner_fail_limiter.allow(source):
                 self.pending[request_id] = pending
-            raise OAuthError("access_denied", "invalid owner approval secret", status=401)
+                raise OAuthError("access_denied", denial, status=401)
+
+            expected = self.config.owner_approval_secret or ""
+            if not expected or not secrets.compare_digest(owner_secret, expected):
+                self._owner_fail_limiter.record(source)
+                self.pending[request_id] = pending
+                raise OAuthError("access_denied", denial, status=401)
+
+            client = self.clients.get(pending.client_id)
+            if client is not None:
+                client.last_used_at = time.time()
 
         code_value = _new_token("code")
         auth_code = AuthCode(
@@ -388,6 +657,7 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
         )
         with self._lock:
             self.codes[code_value] = auth_code
+            self._persist_locked()
         return redirect({"code": code_value})
 
     def exchange_token(self, form: dict[str, str]) -> dict[str, Any]:
@@ -429,6 +699,7 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
             if not verifier or _pkce_s256(verifier) != record.code_challenge:
                 raise OAuthError("invalid_grant", "PKCE verification failed")
 
+            client.last_used_at = time.time()
             return self._issue_tokens(
                 client_id=client_id,
                 resource=record.resource,
@@ -459,6 +730,9 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
                 if not requested.issubset(record.scopes):
                     raise OAuthError("invalid_scope", "cannot expand scopes on refresh")
                 scopes = requested
+            client = self.clients.get(client_id)
+            if client is not None:
+                client.last_used_at = time.time()
             return self._issue_tokens(
                 client_id=client_id,
                 resource=record.resource,
@@ -485,6 +759,7 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
         )
         self.access_tokens[access.token] = access
         self.refresh_tokens[refresh.token] = refresh
+        self._persist_locked()
         return {
             "access_token": access.token,
             "token_type": "Bearer",
@@ -500,14 +775,17 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
         with self._lock:
             if hint in {"", "access_token"} and token in self.access_tokens:
                 self.access_tokens[token].revoked = True
+                self._persist_locked()
                 return
             if hint in {"", "refresh_token"} and token in self.refresh_tokens:
                 self.refresh_tokens[token].revoked = True
+                self._persist_locked()
                 return
             if token in self.access_tokens:
                 self.access_tokens[token].revoked = True
             if token in self.refresh_tokens:
                 self.refresh_tokens[token].revoked = True
+            self._persist_locked()
             # RFC 7009: invalid tokens still return 200.
 
     def validate_bearer(

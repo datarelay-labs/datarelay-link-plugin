@@ -434,9 +434,17 @@ class OAuthRelayTestCase(unittest.TestCase):
             },
         )
         self.assertEqual(status, 403)
-        self.assertIn("WWW-Authenticate", headers)
+        www = headers.get("WWW-Authenticate", "")
+        self.assertIn("resource_metadata=", www)
+        self.assertIn('error="insufficient_scope"', www)
+        self.assertIn("error_description=", www)
         assert isinstance(body, dict)
-        self.assertEqual(body["error"], "unauthorized")
+        self.assertEqual(body.get("jsonrpc"), "2.0")
+        result = body["result"]
+        meta = result["_meta"]["mcp/www_authenticate"]
+        self.assertEqual(meta, [www])
+        self.assertIn('error="insufficient_scope"', meta[0])
+        self.assertIn("error_description=", meta[0])
 
     def test_expired_access_token_rejected(self) -> None:
         redirect = "https://chatgpt.com/connector/oauth/__test__"
@@ -531,8 +539,76 @@ class OAuthRelayTestCase(unittest.TestCase):
         www = headers.get("WWW-Authenticate", "")
         self.assertIn("resource_metadata=", www)
         self.assertIn("/.well-known/oauth-protected-resource", www)
+        self.assertIn(f'scope="{DEFAULT_SCOPE}"', www)
+        self.assertIn('error="invalid_token"', www)
+        self.assertIn("error_description=", www)
         assert isinstance(body, dict)
-        self.assertEqual(body["error"], "unauthorized")
+        self.assertEqual(body["jsonrpc"], "2.0")
+        self.assertEqual(body["id"], 1)
+        result = body["result"]
+        self.assertTrue(result.get("isError"))
+        meta = result["_meta"]["mcp/www_authenticate"]
+        self.assertEqual(meta, [www])
+        self.assertIn('error="invalid_token"', meta[0])
+        self.assertIn("error_description=", meta[0])
+        # Challenge must not leak token material.
+        self.assertNotIn("Bearer upstream-secret", www)
+        self.assertNotIn(self.owner_secret, www)
+
+    def test_dcr_redirect_uri_scheme_hardening(self) -> None:
+        cases = [
+            ("https://chatgpt.com/connector/oauth/ok", True),
+            ("http://127.0.0.1:8787/callback", True),
+            ("http://localhost/callback", True),
+            ("http://[::1]/callback", True),
+            ("javascript:alert(1)", False),
+            ("data:text/html,hi", False),
+            ("com.example.app:/oauth", False),
+            ("chatgpt://oauth/callback", False),
+            ("http://evil.example/callback", False),
+            ("https://chatgpt.com/cb#frag", False),
+            ("not-a-url", False),
+            ("", False),
+        ]
+        for uri, ok in cases:
+            with self.subTest(uri=uri, ok=ok):
+                status, _, body = self._json(
+                    "POST",
+                    "/oauth/register",
+                    body={
+                        "redirect_uris": [uri],
+                        "client_name": "scheme-test",
+                        "token_endpoint_auth_method": "none",
+                    },
+                )
+                if ok:
+                    self.assertEqual(status, 201, body)
+                else:
+                    self.assertEqual(status, 400, body)
+                    assert isinstance(body, dict)
+                    self.assertEqual(body["error"], "invalid_redirect_uri")
+
+    def test_dcr_redirect_uri_exact_match_still_enforced(self) -> None:
+        redirect = "https://chatgpt.com/connector/oauth/exact"
+        client_id = self._register(redirect)
+        verifier, challenge = _pkce_pair()
+        status, _, body = self._json(
+            "GET",
+            "/oauth/authorize?"
+            + parse.urlencode(
+                {
+                    "response_type": "code",
+                    "client_id": client_id,
+                    "redirect_uri": redirect + "-mismatch",
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                    "resource": self.resource,
+                }
+            ),
+        )
+        self.assertEqual(status, 400)
+        assert isinstance(body, dict)
+        self.assertEqual(body["error"], "invalid_request")
 
     def test_valid_oauth_token_proxies_mcp(self) -> None:
         redirect = "https://chatgpt.com/connector/oauth/__test__"

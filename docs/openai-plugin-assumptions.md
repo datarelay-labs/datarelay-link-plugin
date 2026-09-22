@@ -38,7 +38,7 @@ Recorded: 2026-09-22 (Packet 2 OAuth re-check).
 4. Authorization Code + PKCE with `S256` is required; advertise `code_challenge_methods_supported: ["S256"]`.
 5. Echo the `resource` parameter (RFC 8707) through authorize and token requests; validate audience on each MCP request.
 6. Client identification options: CIMD, DCR, or predefined clients. This PoC implements **DCR** only; CIMD is a later optimization.
-7. ChatGPT tool linking also expects per-tool `securitySchemes` plus runtime `_meta["mcp/www_authenticate"]` from the **upstream** MCP server for tool-level linking UI; the relay must pass those through unchanged and must itself challenge unauthenticated `/mcp` HTTP requests.
+7. ChatGPT tool linking also expects per-tool `securitySchemes` plus runtime `_meta["mcp/www_authenticate"]` from the **upstream** MCP server for tool-level linking UI; the relay must pass those through unchanged. When the relay itself rejects an unauthenticated/insufficient-scope MCP JSON-RPC request, it emits HTTP 401/403 with a Bearer `WWW-Authenticate` challenge (`resource_metadata`, `scope`, `error`, `error_description`) and a coherent `_meta["mcp/www_authenticate"]` payload so ChatGPT can surface connect/reconnect UI.
 
 ## DataRelay Link Plugin implications
 

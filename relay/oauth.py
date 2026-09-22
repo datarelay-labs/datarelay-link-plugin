@@ -52,14 +52,20 @@ def _exact_redirect_allowed(registered: list[str], redirect_uri: str) -> bool:
 
 
 def _redirect_uri_safe(uri: str) -> bool:
+    """Accept HTTPS redirects, or HTTP only on explicit loopback hosts.
+
+    ChatGPT Plus cloud OAuth uses HTTPS callbacks. Custom schemes (including
+    javascript:/data:) and non-loopback HTTP are rejected for this PoC.
+    """
     parsed = urlparse(uri)
+    if parsed.fragment:
+        return False
     if parsed.scheme == "https":
-        return bool(parsed.netloc) and not parsed.fragment
+        return bool(parsed.netloc)
     if parsed.scheme == "http":
         host = (parsed.hostname or "").lower()
-        return host in {"localhost", "127.0.0.1", "::1"} and not parsed.fragment
-    # Custom schemes used by some native clients (ChatGPT uses https callbacks).
-    return bool(parsed.scheme) and bool(parsed.netloc or parsed.path) and not parsed.fragment
+        return host in {"localhost", "127.0.0.1", "::1"}
+    return False
 
 
 @dataclass
@@ -525,10 +531,38 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
                 raise OAuthError("insufficient_scope", "missing required scope", status=403)
             return record
 
-    def www_authenticate(self, *, error: str | None = None, scope: str | None = None) -> str:
+    def www_authenticate(
+        self,
+        *,
+        error: str | None = None,
+        error_description: str | None = None,
+        scope: str | None = None,
+    ) -> str:
+        """Build a Bearer WWW-Authenticate challenge for HTTP and MCP `_meta`.
+
+        When ``error`` is set, both ``error`` and a safe ``error_description``
+        are included so ChatGPT can surface the connect/reconnect UI.
+        """
         metadata = f"{self.issuer}/.well-known/oauth-protected-resource"
         parts = [f'Bearer resource_metadata="{metadata}"']
         parts.append(f'scope="{scope or DEFAULT_SCOPE}"')
         if error:
-            parts.append(f'error="{error}"')
+            safe_error = error.replace("\\", "").replace('"', "")
+            parts.append(f'error="{safe_error}"')
+            desc = error_description or _default_error_description(error)
+            # Prevent header/meta injection via quotes or control chars.
+            safe_desc = (
+                "".join(ch for ch in desc if ch.isprintable() and ch not in {'"', "\\"})
+                .strip()
+                or _default_error_description(error)
+            )
+            parts.append(f'error_description="{safe_desc}"')
         return ", ".join(parts)
+
+
+def _default_error_description(error: str) -> str:
+    if error == "insufficient_scope":
+        return "missing required scope"
+    if error == "invalid_token":
+        return "authentication required"
+    return "authentication required"

@@ -332,6 +332,36 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._send_json(400, {"error": "invalid_request"})
 
+    def _mcp_auth_challenge_payload(
+        self,
+        body: bytes,
+        *,
+        challenge: str,
+        description: str,
+    ) -> dict[str, Any] | None:
+        """Return JSON-RPC auth challenge with `_meta["mcp/www_authenticate"]`.
+
+        Used when an MCP JSON-RPC request is rejected so ChatGPT can surface the
+        tool-level connect UI together with upstream ``securitySchemes``.
+        Non-JSON-RPC bodies return None (HTTP 401 + WWW-Authenticate only).
+        """
+        try:
+            parsed = json.loads(body.decode("utf-8") or "null")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(parsed, dict) or parsed.get("jsonrpc") != "2.0":
+            return None
+        text = description.strip() or "authentication required"
+        return {
+            "jsonrpc": "2.0",
+            "id": parsed.get("id"),
+            "result": {
+                "content": [{"type": "text", "text": text}],
+                "isError": True,
+                "_meta": {"mcp/www_authenticate": [challenge]},
+            },
+        }
+
     def _handle_mcp(self, method: str) -> None:
         config = self.server.relay_config
         logger = self.server.audit_logger
@@ -353,10 +383,20 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             extra: list[tuple[str, str]] = []
             oauth = self._oauth()
             if config.auth_mode == AUTH_MODE_OAUTH and oauth is not None:
-                error = (
+                error = exc.oauth_error or (
                     "insufficient_scope" if exc.status == 403 else "invalid_token"
                 )
-                extra.append(("WWW-Authenticate", oauth.www_authenticate(error=error)))
+                description = exc.oauth_description or str(exc)
+                challenge = oauth.www_authenticate(
+                    error=error, error_description=description
+                )
+                extra.append(("WWW-Authenticate", challenge))
+                rpc_payload = self._mcp_auth_challenge_payload(
+                    body, challenge=challenge, description=description
+                )
+                if rpc_payload is not None:
+                    self._send_json(exc.status, rpc_payload, extra_headers=extra)
+                    return
             self._send_json(
                 exc.status,
                 {"error": "unauthorized", "message": str(exc)},

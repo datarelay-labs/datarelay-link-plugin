@@ -11,9 +11,18 @@ from .oauth import OAuthError, OAuthService
 class BindingError(PermissionError):
     """Inbound identity is not bound to an upstream."""
 
-    def __init__(self, message: str, *, status: int = 401) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 401,
+        oauth_error: str | None = None,
+        oauth_description: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.oauth_error = oauth_error
+        self.oauth_description = oauth_description
 
 
 @dataclass(frozen=True)
@@ -101,7 +110,12 @@ class BindingResolver:
             try:
                 token = self._oauth.validate_bearer(authorization_header)
             except OAuthError as exc:
-                raise BindingError(str(exc), status=exc.status) from exc
+                raise BindingError(
+                    str(exc),
+                    status=exc.status,
+                    oauth_error=exc.error,
+                    oauth_description=exc.description,
+                ) from exc
             return _upstream_binding(
                 self._config,
                 binding_id="oauth-binding-1",

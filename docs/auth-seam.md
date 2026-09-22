@@ -34,7 +34,13 @@ Future multi-user / production identity service is out of scope.
 
 - Exactly one configured owner approval secret (`DRLINK_RELAY_OWNER_APPROVAL_SECRET`).
 - Exactly one configured upstream DRLink binding.
-- No tenant database; in-memory clients/tokens for PoC only.
+- Durable OAuth state (`DRLINK_RELAY_OAUTH_STATE_PATH`) persists DCR clients and
+  refresh/revocation records across restarts; public/non-loopback OAuth requires it.
+- Loopback OAuth tests may set `DRLINK_RELAY_OAUTH_ALLOW_EPHEMERAL=1` instead of a
+  state file; ephemeral mode is not allowed for public listeners.
+- Access tokens and authorization codes remain short-lived/ephemeral; reconnect
+  uses persisted refresh tokens.
+- DCR registration and owner-approval failures are rate-limited per source address.
 - Production OAuth mode never falls back to mock bearer tokens.
 - Non-loopback listeners should use `oauth` mode; mock on public bind remains a
   Packet 1 unsafe override only (`DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND=1` +

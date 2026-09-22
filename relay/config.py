@@ -35,6 +35,8 @@ class RelayConfig:
     resource_url: str | None
     owner_approval_secret: str | None
     allow_non_loopback_bind: bool
+    oauth_state_path: str | None
+    oauth_allow_ephemeral: bool
 
 
 _BLOCKED_HOSTNAMES = {"metadata.google.internal", "metadata"}
@@ -204,6 +206,8 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
     public_base_url: str | None = None
     resource_url: str | None = None
     owner_approval_secret: str | None = None
+    oauth_state_path: str | None = None
+    oauth_allow_ephemeral = False
 
     if auth_mode == AUTH_MODE_OAUTH:
         public_raw = (env.get("DRLINK_RELAY_PUBLIC_BASE_URL") or "").strip().rstrip("/")
@@ -249,6 +253,33 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
                 "DRLINK_RELAY_OWNER_APPROVAL_SECRET must be at least 16 characters"
             )
 
+        state_raw = (env.get("DRLINK_RELAY_OAUTH_STATE_PATH") or "").strip()
+        oauth_allow_ephemeral = env.get(
+            "DRLINK_RELAY_OAUTH_ALLOW_EPHEMERAL", ""
+        ).strip() in {"1", "true", "TRUE", "yes", "YES"}
+        public_host = public_parsed.hostname or ""
+        public_is_loopback = _is_loopback_host(public_host)
+        bind_is_loopback = _is_loopback_host(bind_host)
+        requires_durable = (not bind_is_loopback) or (not public_is_loopback)
+
+        if state_raw:
+            oauth_state_path = state_raw
+            if oauth_allow_ephemeral:
+                raise ConfigError(
+                    "DRLINK_RELAY_OAUTH_ALLOW_EPHEMERAL cannot be set together with "
+                    "DRLINK_RELAY_OAUTH_STATE_PATH"
+                )
+        elif requires_durable:
+            raise ConfigError(
+                "public/non-loopback oauth mode requires DRLINK_RELAY_OAUTH_STATE_PATH "
+                "(durable client/refresh state)"
+            )
+        elif not oauth_allow_ephemeral:
+            raise ConfigError(
+                "loopback oauth mode requires DRLINK_RELAY_OAUTH_STATE_PATH "
+                "or explicit DRLINK_RELAY_OAUTH_ALLOW_EPHEMERAL=1 for tests"
+            )
+
     if not _is_loopback_host(bind_host):
         if auth_mode == AUTH_MODE_OAUTH:
             # OAuth is the supported production-mode path for public listeners.
@@ -284,4 +315,6 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
         resource_url=resource_url,
         owner_approval_secret=owner_approval_secret,
         allow_non_loopback_bind=allow_non_loopback_bind,
+        oauth_state_path=oauth_state_path,
+        oauth_allow_ephemeral=oauth_allow_ephemeral,
     )

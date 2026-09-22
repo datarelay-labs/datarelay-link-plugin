@@ -35,7 +35,8 @@ This repository must not modify `datarelay-labs/datarelay-link`. Core MCP intero
 - OAuth mode hosts `/.well-known/oauth-protected-resource` and
   `/.well-known/oauth-authorization-server` on the relay origin.
 - Built-in AS: Authorization Code + PKCE S256, DCR (public clients), token +
-  revoke endpoints, owner consent UI gated by runtime approval secret.
+  revoke endpoints, durable client/refresh state, per-source abuse limits, and
+  owner consent UI gated by runtime approval secret.
 - Access tokens are resource-bound to the configured MCP canonical URL and
   validated on every `/mcp` request; inbound ChatGPT tokens are never forwarded
   upstream.

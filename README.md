@@ -62,11 +62,17 @@ export DRLINK_RELAY_UPSTREAM_TOKEN="replace-me"
 export DRLINK_RELAY_AUTH_MODE=oauth
 export DRLINK_RELAY_PUBLIC_BASE_URL="http://127.0.0.1:8741"
 export DRLINK_RELAY_OWNER_APPROVAL_SECRET="replace-with-long-runtime-secret"
+export DRLINK_RELAY_OAUTH_STATE_PATH="/var/lib/datarelay-link-plugin/oauth-state.json"
 export DRLINK_RELAY_BIND=127.0.0.1
 export DRLINK_RELAY_PORT=8741
 
 PYTHONPATH=. python3 -m relay
 ```
+
+For local ephemeral tests only (loopback), set
+`DRLINK_RELAY_OAUTH_ALLOW_EPHEMERAL=1` instead of a state path. Public / non-loopback
+OAuth always requires a durable state file (mode `0600`, parent dir not
+group/world-writable).
 
 Discovery:
 

@@ -185,6 +185,10 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, oauth.authorization_server_metadata())
 
+    def _client_source(self) -> str:
+        host = self.client_address[0] if self.client_address else "unknown"
+        return host or "unknown"
+
     def _handle_register(self) -> None:
         logger = self.server.audit_logger
         try:
@@ -209,11 +213,19 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                         "token_endpoint_auth_method", "none"
                     ),
                 }
-            result = oauth.register_client(body if isinstance(body, dict) else {})
+            result = oauth.register_client(
+                body if isinstance(body, dict) else {},
+                source=self._client_source(),
+            )
             audit_event(logger, "oauth_client_registered", client_id=result["client_id"])
             self._send_json(201, result)
         except OAuthError as exc:
-            audit_event(logger, "oauth_register_denied", reason=exc.error)
+            audit_event(
+                logger,
+                "oauth_register_denied",
+                reason=exc.error,
+                source=self._client_source(),
+            )
             self._send_json(
                 exc.status,
                 {"error": exc.error, "error_description": exc.description},
@@ -268,6 +280,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
                 request_id=request_id,
                 owner_secret=owner_secret,
                 decision=decision,
+                source=self._client_source(),
             )
             audit_event(
                 logger,
@@ -281,7 +294,12 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             request_id = form.get("request_id", "")
             pending = oauth.pending.get(request_id) if oauth and request_id else None
             if pending is not None and exc.error == "access_denied":
-                audit_event(logger, "oauth_owner_auth_failed", request_id=request_id)
+                audit_event(
+                    logger,
+                    "oauth_owner_auth_failed",
+                    request_id=request_id,
+                    source=self._client_source(),
+                )
                 self._send_html(401, oauth.consent_html(pending, error=exc.description))
                 return
             audit_event(logger, "oauth_authorize_post_denied", reason=exc.error)

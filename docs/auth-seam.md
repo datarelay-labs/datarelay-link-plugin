@@ -43,7 +43,13 @@ Future multi-user / production identity service is out of scope.
 - Unactivated DCR clients (no live refresh binding) have a short TTL, a separate
   inactive-client cap, and are evicted oldest-first at capacity; clients with a
   live non-revoked refresh token are not evicted by ordinary cleanup.
-- DCR registration and owner-approval failures are rate-limited per source address.
+- Pending authorize requests are in-memory only, expire with the auth-code TTL,
+  are swept before admit, and are capped with oldest-first eviction so
+  unauthenticated authorize churn cannot grow memory or lock out ChatGPT.
+- Authorize validation does not update durable `last_used_at` / fsync state;
+  durable client touch happens on successful owner approval and token issuance.
+- DCR registration and owner-approval failures are rate-limited per source address;
+  idle rate-limit source buckets are pruned and the distinct-source map is capped.
 - Production OAuth mode never falls back to mock bearer tokens.
 - Non-loopback listeners should use `oauth` mode; mock on public bind remains a
   Packet 1 unsafe override only (`DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND=1` +

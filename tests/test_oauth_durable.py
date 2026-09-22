@@ -17,9 +17,11 @@ from relay.oauth import (
     INACTIVE_CLIENT_TTL_S,
     MAX_DCR_CLIENTS,
     MAX_INACTIVE_DCR_CLIENTS,
+    MAX_PENDING_AUTHORIZATIONS,
     OWNER_FAIL_LIMIT,
     OAuthError,
     OAuthService,
+    _SlidingWindow,
 )
 from relay.oauth_state import STATE_VERSION, DurableOAuthStore, OAuthStateError
 from tests.test_relay_poc import _free_port
@@ -345,6 +347,82 @@ class DurableOAuthStateTests(unittest.TestCase):
         finally:
             oauth_mod.MAX_DCR_CLIENTS = original_max
             oauth_mod.MAX_INACTIVE_DCR_CLIENTS = original_inactive
+
+    def _authorize(self, svc: OAuthService, client_id: str):
+        return svc.begin_authorization(
+            {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": self.redirect,
+                "code_challenge": "challenge",
+                "code_challenge_method": "S256",
+                "resource": self.resource,
+            }
+        )
+
+    def test_pending_expired_swept_before_admit(self) -> None:
+        svc = OAuthService(self.config)  # type: ignore[arg-type]
+        client_id = self._register(svc)
+        first = self._authorize(svc, client_id)
+        assert not isinstance(first, dict)
+        first.expires_at = time.time() - 1
+        svc.pending[first.request_id] = first
+        second = self._authorize(svc, client_id)
+        assert not isinstance(second, dict)
+        self.assertNotIn(first.request_id, svc.pending)
+        self.assertIn(second.request_id, svc.pending)
+
+    def test_pending_capacity_evicts_oldest_not_legitimate(self) -> None:
+        svc = OAuthService(self.config)  # type: ignore[arg-type]
+        churn_client = self._register(svc, source="198.51.100.1")
+        for _ in range(MAX_PENDING_AUTHORIZATIONS):
+            pending = self._authorize(svc, churn_client)
+            assert not isinstance(pending, dict)
+        self.assertEqual(len(svc.pending), MAX_PENDING_AUTHORIZATIONS)
+        oldest_id = min(
+            svc.pending.items(), key=lambda item: (item[1].expires_at, item[0])
+        )[0]
+        legitimate_client = self._register(svc, source="203.0.113.50")
+        legitimate = self._authorize(svc, legitimate_client)
+        assert not isinstance(legitimate, dict)
+        self.assertLessEqual(len(svc.pending), MAX_PENDING_AUTHORIZATIONS)
+        self.assertIn(legitimate.request_id, svc.pending)
+        self.assertNotIn(oldest_id, svc.pending)
+
+    def test_authorize_does_not_persist_or_refresh_inactive_ttl(self) -> None:
+        svc = OAuthService(self.config)  # type: ignore[arg-type]
+        client_id = self._register(svc)
+        before_mtime = Path(self.state_path).stat().st_mtime_ns
+        before_used = svc.clients[client_id].last_used_at
+        time.sleep(0.02)
+        pending = self._authorize(svc, client_id)
+        assert not isinstance(pending, dict)
+        after_mtime = Path(self.state_path).stat().st_mtime_ns
+        self.assertEqual(after_mtime, before_mtime)
+        self.assertEqual(svc.clients[client_id].last_used_at, before_used)
+
+    def test_pending_churn_cannot_unboundedly_grow(self) -> None:
+        svc = OAuthService(self.config)  # type: ignore[arg-type]
+        client_id = self._register(svc)
+        for _ in range(MAX_PENDING_AUTHORIZATIONS * 3):
+            pending = self._authorize(svc, client_id)
+            assert not isinstance(pending, dict)
+        self.assertLessEqual(len(svc.pending), MAX_PENDING_AUTHORIZATIONS)
+
+    def test_sliding_window_prunes_empty_buckets_and_caps_sources(self) -> None:
+        window = _SlidingWindow(max_events=2, window_s=1.0, max_sources=4)
+        now = time.time()
+        self.assertTrue(window.allow("probe-only", now=now))
+        self.assertNotIn("probe-only", window._events)  # noqa: SLF001
+        for i in range(6):
+            window.record(f"src-{i}", now=now)
+        self.assertLessEqual(len(window._events), 4)  # noqa: SLF001
+        # Advance past window so buckets expire and are swept on next record.
+        later = now + 2.0
+        window.record("fresh", now=later)
+        for key, bucket in list(window._events.items()):  # noqa: SLF001
+            self.assertTrue(bucket)
+            self.assertGreaterEqual(bucket[-1], later - 0.1)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import logging
 import secrets
 import threading
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -35,10 +35,16 @@ MAX_DCR_CLIENTS = 64
 # expire quickly so unauthenticated registration cannot lock out ChatGPT.
 MAX_INACTIVE_DCR_CLIENTS = 16
 INACTIVE_CLIENT_TTL_S = 60 * 60
+# In-memory pending authorize requests (pre-consent). Expired entries are swept
+# before admit; at capacity the oldest pending is evicted so churn cannot lock
+# out a legitimate ChatGPT authorize.
+MAX_PENDING_AUTHORIZATIONS = 32
 DCR_RATE_LIMIT = 8
 DCR_RATE_WINDOW_S = 15 * 60
 OWNER_FAIL_LIMIT = 5
 OWNER_FAIL_WINDOW_S = 15 * 60
+# Bound distinct rate-limit source buckets (empty/expired buckets are pruned).
+MAX_RATE_LIMIT_SOURCES = 256
 
 
 class OAuthError(Exception):
@@ -147,22 +153,52 @@ class PendingAuthorization:
 class _SlidingWindow:
     max_events: int
     window_s: float
-    _events: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
+    max_sources: int = MAX_RATE_LIMIT_SOURCES
+    _events: dict[str, deque[float]] = field(default_factory=dict)
+
+    def _prune_bucket(self, key: str, bucket: deque[float], *, cutoff: float) -> None:
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if not bucket:
+            self._events.pop(key, None)
+
+    def _sweep_expired(self, *, cutoff: float) -> None:
+        for key in list(self._events):
+            bucket = self._events.get(key)
+            if bucket is None:
+                continue
+            self._prune_bucket(key, bucket, cutoff=cutoff)
 
     def allow(self, key: str, *, now: float | None = None) -> bool:
         ts = time.time() if now is None else now
-        bucket = self._events[key]
         cutoff = ts - self.window_s
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
+        bucket = self._events.get(key)
+        if bucket is None:
+            return True
+        self._prune_bucket(key, bucket, cutoff=cutoff)
+        bucket = self._events.get(key)
+        if bucket is None:
+            return True
         return len(bucket) < self.max_events
 
     def record(self, key: str, *, now: float | None = None) -> None:
         ts = time.time() if now is None else now
-        bucket = self._events[key]
         cutoff = ts - self.window_s
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
+        self._sweep_expired(cutoff=cutoff)
+        bucket = self._events.get(key)
+        if bucket is not None:
+            self._prune_bucket(key, bucket, cutoff=cutoff)
+            bucket = self._events.get(key)
+        if bucket is None:
+            if len(self._events) >= self.max_sources:
+                # Evict the idle/oldest source (earliest remaining event).
+                victim = min(
+                    self._events.items(),
+                    key=lambda item: item[1][0] if item[1] else ts,
+                )[0]
+                self._events.pop(victim, None)
+            bucket = deque()
+            self._events[key] = bucket
         bucket.append(ts)
 
 
@@ -359,6 +395,29 @@ class OAuthService:
             self._remove_client_locked(victim.client_id)
             evicted.append(victim.client_id)
         return evicted
+
+    def _cleanup_pending_locked(self, *, now: float, reserve_slots: int = 0) -> list[str]:
+        """Sweep expired pending authorizations; evict oldest when over capacity.
+
+        ``reserve_slots`` leaves room for an incoming authorize (typically 1).
+        Pending state is in-memory only and is never written to durable store.
+        """
+        if reserve_slots < 0:
+            raise ValueError("reserve_slots must be >= 0")
+        removed: list[str] = []
+        for request_id, pending in list(self.pending.items()):
+            if pending.expires_at < now:
+                del self.pending[request_id]
+                removed.append(request_id)
+        budget = max(0, MAX_PENDING_AUTHORIZATIONS - reserve_slots)
+        while len(self.pending) > budget:
+            oldest_id = min(
+                self.pending.items(),
+                key=lambda item: (item[1].expires_at, item[0]),
+            )[0]
+            del self.pending[oldest_id]
+            removed.append(oldest_id)
+        return removed
 
     @property
     def issuer(self) -> str:
@@ -565,9 +624,11 @@ class OAuthService:
             expires_at=time.time() + CODE_TTL_S,
         )
         with self._lock:
-            client.last_used_at = time.time()
+            # Bound in-memory pending only. Do not touch last_used_at / durable
+            # state here: authorize is unauthenticated and would amplify fsync
+            # I/O while refreshing inactive-client TTL under churn.
+            self._cleanup_pending_locked(now=time.time(), reserve_slots=1)
             self.pending[request_id] = pending
-            self._persist_locked()
         return pending
 
     def consent_html(self, pending: PendingAuthorization, error: str | None = None) -> str:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import logging
 import secrets
 import threading
 import time
@@ -19,16 +20,21 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
 
+from .audit import audit_event
 from .config import RelayConfig
 from .oauth_state import STATE_VERSION, DurableOAuthStore, OAuthStateError
+
+_AUDIT_LOGGER = logging.getLogger("drlink.relay")
 
 DEFAULT_SCOPE = "mcp:proxy"
 CODE_TTL_S = 60
 ACCESS_TTL_S = 3600
 REFRESH_TTL_S = 30 * 24 * 3600
 MAX_DCR_CLIENTS = 64
-# Idle clients without a live refresh session may be evicted after this age.
-CLIENT_IDLE_TTL_S = 90 * 24 * 3600
+# Unactivated DCR clients (no live refresh binding) are capped separately and
+# expire quickly so unauthenticated registration cannot lock out ChatGPT.
+MAX_INACTIVE_DCR_CLIENTS = 16
+INACTIVE_CLIENT_TTL_S = 60 * 60
 DCR_RATE_LIMIT = 8
 DCR_RATE_WINDOW_S = 15 * 60
 OWNER_FAIL_LIMIT = 5
@@ -188,6 +194,17 @@ class OAuthService:
             self._store = DurableOAuthStore(self.config.oauth_state_path)
             payload = self._store.load()
             self._load_payload(payload)
+            # Persist TTL cleanup so expired inactive clients do not resurrect.
+            with self._lock:
+                evicted = self._cleanup_inactive_clients_locked(now=time.time(), reserve_slots=0)
+                if evicted:
+                    self._persist_locked()
+                    audit_event(
+                        _AUDIT_LOGGER,
+                        "oauth_dcr_clients_evicted",
+                        reason="inactive_ttl_on_load",
+                        count=len(evicted),
+                    )
 
     def _load_payload(self, payload: dict[str, Any]) -> None:
         clients_raw = payload.get("clients") or {}
@@ -289,27 +306,59 @@ class OAuthService:
                 return True
         return False
 
-    def _evict_idle_clients_locked(self, *, now: float) -> None:
-        """Evict idle clients that cannot lock out an active ChatGPT session."""
-        candidates = [
+    def _remove_client_locked(self, client_id: str) -> None:
+        stale = [
+            tid
+            for tid, tok in self.refresh_tokens.items()
+            if tok.client_id == client_id
+        ]
+        for tid in stale:
+            del self.refresh_tokens[tid]
+        self.clients.pop(client_id, None)
+
+    def _inactive_clients_locked(self, *, now: float) -> list[RegisteredClient]:
+        inactive = [
             c
             for c in self.clients.values()
             if not self._client_has_live_refresh(c.client_id, now=now)
-            and (now - c.last_used_at) >= CLIENT_IDLE_TTL_S
         ]
-        candidates.sort(key=lambda c: c.last_used_at)
-        for client in candidates:
-            if len(self.clients) < MAX_DCR_CLIENTS:
+        inactive.sort(key=lambda c: (c.issued_at, c.last_used_at, c.client_id))
+        return inactive
+
+    def _cleanup_inactive_clients_locked(
+        self, *, now: float, reserve_slots: int = 0
+    ) -> list[str]:
+        """Evict unactivated/inactive DCR clients; never touch live-refresh clients.
+
+        ``reserve_slots`` leaves room for an incoming registration (typically 1).
+        """
+        if reserve_slots < 0:
+            raise ValueError("reserve_slots must be >= 0")
+        evicted: list[str] = []
+
+        # Short TTL for clients that never received (or no longer have) a live refresh.
+        for client in list(self.clients.values()):
+            if self._client_has_live_refresh(client.client_id, now=now):
+                continue
+            if (now - client.last_used_at) < INACTIVE_CLIENT_TTL_S:
+                continue
+            self._remove_client_locked(client.client_id)
+            evicted.append(client.client_id)
+
+        inactive_budget = max(0, MAX_INACTIVE_DCR_CLIENTS - reserve_slots)
+        total_budget = max(0, MAX_DCR_CLIENTS - reserve_slots)
+        while True:
+            inactive = self._inactive_clients_locked(now=now)
+            over_inactive = len(inactive) > inactive_budget
+            over_total = len(self.clients) > total_budget
+            if not over_inactive and not over_total:
                 break
-            # Remove revoked/expired refresh rows belonging to the idle client.
-            stale = [
-                tid
-                for tid, tok in self.refresh_tokens.items()
-                if tok.client_id == client.client_id
-            ]
-            for tid in stale:
-                del self.refresh_tokens[tid]
-            del self.clients[client.client_id]
+            if not inactive:
+                break
+            victim = inactive[0]
+            self._remove_client_locked(victim.client_id)
+            evicted.append(victim.client_id)
+        return evicted
 
     @property
     def issuer(self) -> str:
@@ -364,8 +413,26 @@ class OAuthService:
                     status=429,
                 )
             now = time.time()
-            self._evict_idle_clients_locked(now=now)
+            evicted = self._cleanup_inactive_clients_locked(now=now, reserve_slots=1)
+            if evicted:
+                audit_event(
+                    _AUDIT_LOGGER,
+                    "oauth_dcr_clients_evicted",
+                    reason="inactive_capacity",
+                    count=len(evicted),
+                )
             if len(self.clients) >= MAX_DCR_CLIENTS:
+                audit_event(
+                    _AUDIT_LOGGER,
+                    "oauth_dcr_registration_exhausted",
+                    reason="active_client_capacity",
+                    active_clients=sum(
+                        1
+                        for cid in self.clients
+                        if self._client_has_live_refresh(cid, now=now)
+                    ),
+                    total_clients=len(self.clients),
+                )
                 raise OAuthError(
                     "invalid_client_metadata",
                     "client registration limit reached",

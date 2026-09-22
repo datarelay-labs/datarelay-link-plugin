@@ -40,6 +40,9 @@ Future multi-user / production identity service is out of scope.
   state file; ephemeral mode is not allowed for public listeners.
 - Access tokens and authorization codes remain short-lived/ephemeral; reconnect
   uses persisted refresh tokens.
+- Unactivated DCR clients (no live refresh binding) have a short TTL, a separate
+  inactive-client cap, and are evicted oldest-first at capacity; clients with a
+  live non-revoked refresh token are not evicted by ordinary cleanup.
 - DCR registration and owner-approval failures are rate-limited per source address.
 - Production OAuth mode never falls back to mock bearer tokens.
 - Non-loopback listeners should use `oauth` mode; mock on public bind remains a

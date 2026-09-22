@@ -11,8 +11,12 @@ import unittest
 from pathlib import Path
 
 from relay.config import load_config
+from relay import oauth as oauth_mod
 from relay.oauth import (
     DCR_RATE_LIMIT,
+    INACTIVE_CLIENT_TTL_S,
+    MAX_DCR_CLIENTS,
+    MAX_INACTIVE_DCR_CLIENTS,
     OWNER_FAIL_LIMIT,
     OAuthError,
     OAuthService,
@@ -239,6 +243,108 @@ class DurableOAuthStateTests(unittest.TestCase):
         store.save(payload)
         loaded = store.load()
         self.assertTrue(loaded["refresh_tokens"]["rtk_1"]["revoked"])
+
+    def test_inactive_pool_fill_cannot_block_legitimate_registration(self) -> None:
+        svc = OAuthService(self.config)  # type: ignore[arg-type]
+        for i in range(MAX_INACTIVE_DCR_CLIENTS):
+            self._register(svc, source=f"198.51.100.{i}")
+        self.assertEqual(len(svc.clients), MAX_INACTIVE_DCR_CLIENTS)
+        legitimate = self._register(svc, source="203.0.113.50")
+        self.assertIn(legitimate, svc.clients)
+        self.assertLessEqual(len(svc.clients), MAX_INACTIVE_DCR_CLIENTS)
+
+    def test_oldest_inactive_evicted_at_capacity(self) -> None:
+        svc = OAuthService(self.config)  # type: ignore[arg-type]
+        oldest = self._register(svc, source="198.51.100.1")
+        # Ensure deterministic oldest ordering even if clock resolution is coarse.
+        svc.clients[oldest].issued_at -= 10
+        svc.clients[oldest].last_used_at -= 10
+        for i in range(MAX_INACTIVE_DCR_CLIENTS - 1):
+            self._register(svc, source=f"198.51.100.{i + 2}")
+        self.assertEqual(len(svc.clients), MAX_INACTIVE_DCR_CLIENTS)
+        self.assertIn(oldest, svc.clients)
+        newer = self._register(svc, source="203.0.113.60")
+        self.assertNotIn(oldest, svc.clients)
+        self.assertIn(newer, svc.clients)
+
+    def test_active_client_with_live_refresh_never_evicted(self) -> None:
+        svc = OAuthService(self.config)  # type: ignore[arg-type]
+        active = self._register(svc, source="198.51.100.1")
+        refresh = self._issue_refresh(svc, active)
+        for round_i in range(3):
+            for i in range(MAX_INACTIVE_DCR_CLIENTS):
+                self._register(svc, source=f"198.51.100.{(round_i * 32 + i) % 200 + 2}")
+        self.assertIn(active, svc.clients)
+        self.assertTrue(svc._client_has_live_refresh(active, now=time.time()))  # noqa: SLF001
+        churn = self._register(svc, source="203.0.113.200")
+        self.assertIn(active, svc.clients)
+        self.assertIn(churn, svc.clients)
+        refreshed = svc.exchange_token(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+                "client_id": active,
+                "resource": self.resource,
+            }
+        )
+        self.assertIn("access_token", refreshed)
+
+    def test_inactive_ttl_cleanup_persists_across_restart(self) -> None:
+        svc1 = OAuthService(self.config)  # type: ignore[arg-type]
+        expired = self._register(svc1, source="198.51.100.1")
+        keep = self._register(svc1, source="198.51.100.2")
+        svc1.clients[expired].last_used_at -= INACTIVE_CLIENT_TTL_S + 5
+        svc1.clients[expired].issued_at = int(svc1.clients[expired].last_used_at)
+        svc1._persist_locked()  # noqa: SLF001
+        svc2 = OAuthService(self.config)  # type: ignore[arg-type]
+        self.assertNotIn(expired, svc2.clients)
+        self.assertIn(keep, svc2.clients)
+        payload = json.loads(Path(self.state_path).read_text(encoding="utf-8"))
+        self.assertNotIn(expired, payload["clients"])
+        self.assertIn(keep, payload["clients"])
+
+    def test_distributed_sources_cannot_lock_out_real_client(self) -> None:
+        svc = OAuthService(self.config)  # type: ignore[arg-type]
+        # Many distinct sources past the historical hard-full table size.
+        for i in range(MAX_DCR_CLIENTS + 8):
+            self._register(svc, source=f"203.0.113.{(i % 250) + 1}")
+        self.assertLessEqual(len(svc.clients), MAX_INACTIVE_DCR_CLIENTS)
+        real = self._register(svc, source="198.51.100.99")
+        self.assertIn(real, svc.clients)
+        refresh = self._issue_refresh(svc, real)
+        for i in range(MAX_INACTIVE_DCR_CLIENTS + 4):
+            self._register(svc, source=f"192.0.2.{(i % 250) + 1}")
+        self.assertIn(real, svc.clients)
+        svc2 = OAuthService(self.config)  # type: ignore[arg-type]
+        self.assertIn(real, svc2.clients)
+        refreshed = svc2.exchange_token(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+                "client_id": real,
+                "resource": self.resource,
+            }
+        )
+        self.assertIn("access_token", refreshed)
+
+    def test_full_active_capacity_still_rejects(self) -> None:
+        """Only when every durable slot holds a live-refresh client do we reject."""
+        svc = OAuthService(self.config)  # type: ignore[arg-type]
+        original_max = oauth_mod.MAX_DCR_CLIENTS
+        original_inactive = oauth_mod.MAX_INACTIVE_DCR_CLIENTS
+        try:
+            oauth_mod.MAX_DCR_CLIENTS = 3
+            oauth_mod.MAX_INACTIVE_DCR_CLIENTS = 3
+            for i in range(3):
+                cid = self._register(svc, source=f"198.51.100.{i}")
+                self._issue_refresh(svc, cid)
+            with self.assertRaises(OAuthError) as ctx:
+                self._register(svc, source="203.0.113.1")
+            self.assertEqual(ctx.exception.error, "invalid_client_metadata")
+            self.assertIn("limit reached", ctx.exception.description)
+        finally:
+            oauth_mod.MAX_DCR_CLIENTS = original_max
+            oauth_mod.MAX_INACTIVE_DCR_CLIENTS = original_inactive
 
 
 if __name__ == "__main__":

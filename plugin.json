@@ -1,0 +1,31 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "datarelay-link",
+  "version": "0.1.0",
+  "description": "Secure access to authorized private hosts through DataRelay Link.",
+  "author": {
+    "name": "DataRelay Labs",
+    "url": "https://datarelay.run"
+  },
+  "homepage": "https://github.com/datarelay-labs/datarelay-link-plugin",
+  "repository": "https://github.com/datarelay-labs/datarelay-link-plugin",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "chatgpt", "datarelay", "remote-access"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "DataRelay Link",
+        "shortDescription": "Secure access to authorized private hosts through DataRelay Link.",
+        "longDescription": "Connect ChatGPT to hosts authorized by your DataRelay Link Server. The Plugin talks to a DataRelay MCP relay; DRLink Server remains the final authorization source of truth on every tool call.",
+        "developerName": "DataRelay Labs",
+        "category": "Developer Tools",
+        "capabilities": ["Read", "Write"],
+        "websiteURL": "https://datarelay.run",
+        "defaultPrompt": [
+          "Use DataRelay Link to list tools available on my authorized host.",
+          "Use DataRelay Link only for actions my DRLink AI Access policy allows."
+        ]
+      }
+    }
+  }
+}

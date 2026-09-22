@@ -1,0 +1,44 @@
+version: 1
+
+setup_command: "python3 -m pip install -r requirements-dev.txt"
+
+paths:
+  "**":
+    domains:
+      - "core"
+
+scenarios:
+  - id: ADOPTED-STATIC-001
+    name: Git whitespace validation
+    level: static
+    domains:
+      - "core"
+    triggers:
+      - pr
+      - preflight
+      - release
+    platforms:
+      - "linux"
+    command: "git diff --check"
+    invariants:
+      - "repository diff has no whitespace errors"
+    release_gate: true
+
+  - id: RELAY-UNIT-001
+    name: Plugin schema and relay PoC unit tests
+    level: unit
+    domains:
+      - "core"
+    triggers:
+      - pr
+      - preflight
+      - release
+    platforms:
+      - "linux"
+    command: "PYTHONPATH=. python3 -m unittest discover -s tests -v"
+    invariants:
+      - "manifest schemas validate"
+      - "MCP initialize/tools/list/tools/call pass through"
+      - "upstream unavailable fails closed"
+      - "secrets are not logged or exposed via /health"
+    release_gate: true

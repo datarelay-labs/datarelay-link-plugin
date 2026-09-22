@@ -1,0 +1,30 @@
+engineering_system:
+  version: "1.6.0"
+  mode: adopted
+  baseline: "673c3b339a0765657214d40a22400a04ed54425b"
+  ci_mode: "shared"
+  native_ci_workflows: []
+  merge_gate_status: "advisory"
+
+project:
+  name: "datarelay-link-plugin"
+  type: "python"
+  maturity: "experimental"
+
+domains:
+  - "core"
+
+platforms:
+  - "linux"
+
+operations:
+  production_oriented: false
+  runbook_required: false
+  incident_response_required: false
+  persistent_state: false
+  runbook_paths: []
+  health_command: ""
+  backup_command: ""
+  restore_test_command: ""
+  upgrade_command: ""
+  rollback_command: ""

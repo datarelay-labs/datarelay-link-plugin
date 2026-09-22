@@ -12,13 +12,22 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 from urllib import error, request
 
 from jsonschema import Draft202012Validator
 
 from relay.audit import configure_logging, redact_text, sanitize_headers
-from relay.binding import MockBindingStore
-from relay.config import ConfigError, load_config, validate_upstream_url
+from relay.binding import MockBindingStore, UpstreamBinding
+from relay.config import (
+    DEFAULT_MOCK_PLUGIN_TOKEN,
+    ConfigError,
+    assert_connect_ip_allowed,
+    load_config,
+    validate_upstream_binding,
+    validate_upstream_url,
+)
+from relay.proxy import UpstreamUnavailable, _pinned_connect_ip, proxy_mcp_request
 from relay.server import create_server
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -328,6 +337,127 @@ class RelayTestCase(unittest.TestCase):
         cleaned = sanitize_headers({"Authorization": "Bearer secret", "Mcp-Session-Id": "s1"})
         self.assertEqual(cleaned["Authorization"], "[REDACTED]")
         self.assertEqual(cleaned["Mcp-Session-Id"], "s1")
+
+    def test_license_manifest_consistency(self) -> None:
+        license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        plugin = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
+        self.assertTrue(
+            license_text.startswith("Data Relay Source Available License 1.0"),
+            "LICENSE must be Data Relay Source Available License 1.0",
+        )
+        self.assertNotIn("Apache-2.0", plugin.get("license", ""))
+        self.assertEqual(plugin.get("license"), "Data Relay Source Available License 1.0")
+        self.assertTrue((ROOT / "LICENSING.md").is_file())
+
+    def test_public_bind_rejects_default_mock_token(self) -> None:
+        base = {
+            "DRLINK_RELAY_UPSTREAM_URL": f"http://127.0.0.1:{self.upstream_port}/mcp",
+            "DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM": "1",
+            "DRLINK_RELAY_BIND": "0.0.0.0",
+            "DRLINK_RELAY_PORT": str(_free_port()),
+        }
+        with self.assertRaises(ConfigError) as ctx_missing_override:
+            load_config({**base, "DRLINK_RELAY_MOCK_PLUGIN_TOKEN": DEFAULT_MOCK_PLUGIN_TOKEN})
+        self.assertIn("NON_LOOPBACK_BIND", str(ctx_missing_override.exception))
+
+        with self.assertRaises(ConfigError) as ctx_default_token:
+            load_config(
+                {
+                    **base,
+                    "DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND": "1",
+                    "DRLINK_RELAY_MOCK_PLUGIN_TOKEN": DEFAULT_MOCK_PLUGIN_TOKEN,
+                }
+            )
+        self.assertIn("default mock plugin token", str(ctx_default_token.exception))
+
+        cfg = load_config(
+            {
+                **base,
+                "DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND": "1",
+                "DRLINK_RELAY_MOCK_PLUGIN_TOKEN": "explicit-strong-dev-token",
+            }
+        )
+        self.assertEqual(cfg.mock_plugin_token, "explicit-strong-dev-token")
+        self.assertEqual(cfg.bind_host, "0.0.0.0")
+
+    def test_dns_rebinding_uses_pinned_connect_ip(self) -> None:
+        # Bind-time resolution returns a public IP; later hostname rebinding must
+        # not change the TCP destination used by the proxy.
+        public_ip = "8.8.8.8"
+        private_ip = "169.254.169.254"
+
+        def fake_getaddrinfo(host, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", (public_ip, 0)),
+            ]
+
+        with patch("relay.config.socket.getaddrinfo", side_effect=fake_getaddrinfo):
+            validated = validate_upstream_binding(
+                "https://rebinding.example/mcp", allow_loopback=False
+            )
+        self.assertEqual(validated.connect_ips, (public_ip,))
+
+        # Simulate post-validation DNS rebinding to a link-local/metadata address.
+        def rebound_getaddrinfo(host, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", (private_ip, 0)),
+            ]
+
+        with patch("socket.getaddrinfo", side_effect=rebound_getaddrinfo):
+            binding = UpstreamBinding(
+                binding_id="mock",
+                upstream_url=validated.url,
+                upstream_connect_ips=validated.connect_ips,
+                allow_loopback_upstream=False,
+                upstream_authorization=None,
+                plugin_subject="t",
+            )
+            # Proxy must still select the bind-time public IP, not re-resolved private.
+            self.assertEqual(_pinned_connect_ip(binding), public_ip)
+
+            # Connect-time defense: a private pinned IP is rejected.
+            bad = UpstreamBinding(
+                binding_id="mock",
+                upstream_url=validated.url,
+                upstream_connect_ips=(private_ip,),
+                allow_loopback_upstream=False,
+                upstream_authorization=None,
+                plugin_subject="t",
+            )
+            with self.assertRaises(UpstreamUnavailable):
+                _pinned_connect_ip(bad)
+
+        with self.assertRaises(ConfigError):
+            assert_connect_ip_allowed(private_ip, allow_loopback=False)
+
+        # End-to-end: pinned loopback IP still reaches the mock upstream even if
+        # hostname resolution would drift afterward.
+        logger = configure_logging(logging.INFO)
+        binding = UpstreamBinding(
+            binding_id="mock",
+            upstream_url=f"http://upstream.example:{self.upstream_port}/mcp",
+            upstream_connect_ips=("127.0.0.1",),
+            allow_loopback_upstream=True,
+            upstream_authorization="Bearer upstream-secret-token",
+            plugin_subject="t",
+        )
+        with patch(
+            "socket.getaddrinfo",
+            side_effect=AssertionError("hostname must not be re-resolved for TCP connect"),
+        ):
+            proxied = proxy_mcp_request(
+                method="POST",
+                binding=binding,
+                body=json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode("utf-8"),
+                request_headers={"Content-Type": "application/json", "Accept": "application/json"},
+                timeout_s=5,
+                logger=logger,
+            )
+        self.assertEqual(proxied.status, 200)
+        payload = json.loads(proxied.body.decode("utf-8"))
+        self.assertEqual(len(payload["result"]["tools"]), 2)
 
 
 if __name__ == "__main__":

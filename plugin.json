@@ -9,7 +9,7 @@
   },
   "homepage": "https://github.com/datarelay-labs/datarelay-link-plugin",
   "repository": "https://github.com/datarelay-labs/datarelay-link-plugin",
-  "license": "Apache-2.0",
+  "license": "Data Relay Source Available License 1.0",
   "keywords": ["mcp", "chatgpt", "datarelay", "remote-access"],
   "extensions": {
     "com.openai": {

@@ -2,6 +2,8 @@
 
 ChatGPT Plus / Codex **Agent Plugins** package and single-user MCP relay PoC for [DataRelay Link](https://github.com/datarelay-labs/datarelay-link).
 
+> **License — Source Available:** licensed under the **Data Relay Source Available License 1.0** (not Apache-2.0 / not OSI open source). See [LICENSE](LICENSE) and [LICENSING.md](LICENSING.md).
+
 Core DRLink continues to work without this repository. Direct DRLink MCP remains supported for clients that allow arbitrary remote MCP endpoints. This repo exists so **ChatGPT Plus** can use DataRelay Link through a published Plugin/App path.
 
 ## Architecture
@@ -51,6 +53,8 @@ Health: `GET http://127.0.0.1:8741/health`
 
 MCP: `POST http://127.0.0.1:8741/mcp` with `Authorization: Bearer dev-plugin-token`
 
+The default mock token is loopback-only. Non-loopback bind requires both `DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND=1` and an explicit non-default `DRLINK_RELAY_MOCK_PLUGIN_TOKEN`.
+
 `mcp.json` points at the local PoC relay URL. Production HTTPS (`mcp.datarelay.run`) is out of scope for Packet 1.
 
 ## Tests
@@ -69,4 +73,5 @@ Packet 1 includes a **dev-only mock binding** (`relay/binding.py`). See [docs/au
 - Never commit OAuth client secrets, upstream tokens, or DRLink private keys.
 - Relay audit logs redact `Authorization` and token-like fields.
 - Upstream URL is an explicit allowlisted binding with SSRF-resistant validation.
+- Upstream TCP connects use bind-time resolved IPs (DNS-rebinding / TOCTOU resistant); HTTPS keeps hostname SNI/certificate verification.
 - No generic open proxy; unbound identities are rejected.

@@ -13,11 +13,15 @@ class ConfigError(ValueError):
     """Invalid or missing relay configuration."""
 
 
+DEFAULT_MOCK_PLUGIN_TOKEN = "dev-plugin-token"
+
+
 @dataclass(frozen=True)
 class RelayConfig:
     bind_host: str
     bind_port: int
     upstream_url: str
+    upstream_connect_ips: tuple[str, ...]
     upstream_token: str | None
     allow_loopback_upstream: bool
     mock_plugin_token: str
@@ -37,7 +41,34 @@ def _is_loopback_host(hostname: str) -> bool:
         return False
 
 
-def _resolve_and_check_host(hostname: str, *, allow_loopback: bool) -> None:
+def assert_connect_ip_allowed(ip_str: str, *, allow_loopback: bool) -> str:
+    """Return a normalized IP string if it is an allowed upstream destination."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError as exc:
+        raise ConfigError(f"invalid upstream connect address: {ip_str}") from exc
+
+    if ip.is_loopback:
+        if not allow_loopback:
+            raise ConfigError(
+                "loopback upstream requires DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM=1"
+            )
+        return str(ip)
+
+    if (
+        ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    ):
+        raise ConfigError(
+            f"upstream resolves to a non-public address which is blocked: {ip}"
+        )
+    return str(ip)
+
+
+def _resolve_allowed_ips(hostname: str, *, allow_loopback: bool) -> tuple[str, ...]:
     if not hostname:
         raise ConfigError("upstream URL hostname is required")
     host = hostname.strip("[]").lower()
@@ -52,29 +83,35 @@ def _resolve_and_check_host(hostname: str, *, allow_loopback: bool) -> None:
     if not infos:
         raise ConfigError(f"upstream hostname cannot be resolved: {host}")
 
+    allowed: list[str] = []
+    seen: set[str] = set()
     for info in infos:
         sockaddr = info[4]
-        ip = ipaddress.ip_address(sockaddr[0])
-        if ip.is_loopback:
-            if not allow_loopback:
-                raise ConfigError(
-                    "loopback upstream requires DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM=1"
-                )
-            continue
-        if (
-            ip.is_private
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            raise ConfigError(
-                f"upstream resolves to a non-public address which is blocked: {ip}"
-            )
+        ip_str = assert_connect_ip_allowed(sockaddr[0], allow_loopback=allow_loopback)
+        if ip_str not in seen:
+            seen.add(ip_str)
+            allowed.append(ip_str)
+
+    if not allowed:
+        raise ConfigError(f"upstream hostname cannot be resolved: {host}")
+    return tuple(allowed)
 
 
 def validate_upstream_url(url: str, *, allow_loopback: bool) -> str:
     """Return a normalized absolute upstream MCP URL or raise ConfigError."""
+    validated = validate_upstream_binding(url, allow_loopback=allow_loopback)
+    return validated.url
+
+
+@dataclass(frozen=True)
+class ValidatedUpstream:
+    url: str
+    hostname: str
+    connect_ips: tuple[str, ...]
+
+
+def validate_upstream_binding(url: str, *, allow_loopback: bool) -> ValidatedUpstream:
+    """Validate upstream URL and bind hostname to resolved allowed IP addresses."""
     raw = (url or "").strip()
     if not raw:
         raise ConfigError("DRLINK_RELAY_UPSTREAM_URL is required")
@@ -97,10 +134,12 @@ def validate_upstream_url(url: str, *, allow_loopback: bool) -> str:
             "loopback upstream requires DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM=1"
         )
 
-    _resolve_and_check_host(parsed.hostname, allow_loopback=allow_loopback)
-
-    # Exact binding allowlist: keep path/query as configured; strip trailing spaces only.
-    return raw.rstrip()
+    connect_ips = _resolve_allowed_ips(parsed.hostname, allow_loopback=allow_loopback)
+    return ValidatedUpstream(
+        url=raw.rstrip(),
+        hostname=parsed.hostname.strip("[]"),
+        connect_ips=connect_ips,
+    )
 
 
 def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
@@ -112,7 +151,7 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
         "yes",
         "YES",
     }
-    upstream = validate_upstream_url(
+    upstream = validate_upstream_binding(
         env.get("DRLINK_RELAY_UPSTREAM_URL", ""),
         allow_loopback=allow_loopback,
     )
@@ -137,16 +176,34 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
     if timeout_s <= 0:
         raise ConfigError("DRLINK_RELAY_TIMEOUT_S must be positive")
 
-    mock_plugin_token = (
-        env.get("DRLINK_RELAY_MOCK_PLUGIN_TOKEN") or "dev-plugin-token"
-    ).strip()
+    explicit_mock_token = env.get("DRLINK_RELAY_MOCK_PLUGIN_TOKEN")
+    if explicit_mock_token is None:
+        mock_plugin_token = DEFAULT_MOCK_PLUGIN_TOKEN
+    else:
+        mock_plugin_token = explicit_mock_token.strip()
     if not mock_plugin_token:
         raise ConfigError("DRLINK_RELAY_MOCK_PLUGIN_TOKEN must not be empty")
+
+    allow_non_loopback_bind = env.get(
+        "DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND", ""
+    ).strip() in {"1", "true", "TRUE", "yes", "YES"}
+    if not _is_loopback_host(bind_host):
+        if not allow_non_loopback_bind:
+            raise ConfigError(
+                "non-loopback bind requires DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND=1 "
+                "(dev-only mock binding is not safe on public interfaces)"
+            )
+        if mock_plugin_token == DEFAULT_MOCK_PLUGIN_TOKEN:
+            raise ConfigError(
+                "non-loopback bind rejects the default mock plugin token; "
+                "set an explicit strong DRLINK_RELAY_MOCK_PLUGIN_TOKEN"
+            )
 
     return RelayConfig(
         bind_host=bind_host,
         bind_port=bind_port,
-        upstream_url=upstream,
+        upstream_url=upstream.url,
+        upstream_connect_ips=upstream.connect_ips,
         upstream_token=token,
         allow_loopback_upstream=allow_loopback,
         mock_plugin_token=mock_plugin_token,

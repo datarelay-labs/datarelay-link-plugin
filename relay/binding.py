@@ -15,6 +15,8 @@ class BindingError(PermissionError):
 class UpstreamBinding:
     binding_id: str
     upstream_url: str
+    upstream_connect_ips: tuple[str, ...]
+    allow_loopback_upstream: bool
     upstream_authorization: str | None
     plugin_subject: str
 
@@ -49,6 +51,8 @@ class MockBindingStore:
         return UpstreamBinding(
             binding_id=self._binding_id,
             upstream_url=self._config.upstream_url,
+            upstream_connect_ips=self._config.upstream_connect_ips,
+            allow_loopback_upstream=self._config.allow_loopback_upstream,
             upstream_authorization=upstream_auth,
             plugin_subject=self._subject,
         )

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import logging
+import socket
+import ssl
 from dataclasses import dataclass
 from typing import Iterable
 from urllib.parse import urlparse
 
 from .audit import audit_event
 from .binding import UpstreamBinding
+from .config import ConfigError, assert_connect_ip_allowed
 
 # Headers forwarded from client → upstream (case-insensitive match).
 _FORWARD_REQUEST_HEADERS = {
@@ -52,6 +56,76 @@ def _select_headers(
     return out
 
 
+def _pinned_connect_ip(binding: UpstreamBinding) -> str:
+    if not binding.upstream_connect_ips:
+        raise UpstreamUnavailable("upstream MCP endpoint unavailable")
+    # Connect only to IPs validated at bind time — never re-resolve hostname
+    # for the TCP destination (closes DNS-rebinding / TOCTOU SSRF).
+    connect_ip = binding.upstream_connect_ips[0]
+    try:
+        return assert_connect_ip_allowed(
+            connect_ip, allow_loopback=binding.allow_loopback_upstream
+        )
+    except ConfigError as exc:
+        raise UpstreamUnavailable("upstream MCP endpoint unavailable") from exc
+
+
+def _dial_pinned_ip(connect_ip: str, port: int, timeout: float | None) -> socket.socket:
+    """Open a TCP socket to a literal IP without calling getaddrinfo on a hostname."""
+    ip = ipaddress.ip_address(connect_ip)
+    family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    if timeout is not None:
+        sock.settimeout(timeout)
+    try:
+        sock.connect((str(ip), port))
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection that dials a pre-validated IP while keeping Host hostname."""
+
+    def __init__(
+        self,
+        host: str,
+        connect_ip: str,
+        port: int | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self._connect_ip = connect_ip
+
+    def connect(self) -> None:
+        self.sock = _dial_pinned_ip(self._connect_ip, self.port, self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection that dials a pre-validated IP with hostname SNI/certs."""
+
+    def __init__(
+        self,
+        host: str,
+        connect_ip: str,
+        port: int | None = None,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> None:
+        super().__init__(host, port=port, timeout=timeout, context=context)
+        self._connect_ip = connect_ip
+
+    def connect(self) -> None:
+        sock = _dial_pinned_ip(self._connect_ip, self.port, self.timeout)
+        context = self._context or ssl.create_default_context()
+        try:
+            self.sock = context.wrap_socket(sock, server_hostname=self.host)
+        except Exception:
+            sock.close()
+            raise
+
+
 def proxy_mcp_request(
     *,
     method: str,
@@ -83,24 +157,34 @@ def proxy_mcp_request(
         if "content-type" not in {k.lower() for k in headers}:
             headers["Content-Type"] = "application/json"
 
+    connect_ip = _pinned_connect_ip(binding)
+
     audit_event(
         logger,
         "mcp_proxy_request",
         binding_id=binding.binding_id,
         method=method,
         upstream_host=parsed.hostname,
+        upstream_connect_ip=connect_ip,
         request_headers=headers,
         body_bytes=len(body or b""),
     )
 
     connection: http.client.HTTPConnection | http.client.HTTPSConnection
     if parsed.scheme == "https":
-        connection = http.client.HTTPSConnection(
-            parsed.hostname, parsed.port or 443, timeout=timeout_s
+        connection = _PinnedHTTPSConnection(
+            parsed.hostname,
+            connect_ip,
+            parsed.port or 443,
+            timeout=timeout_s,
+            context=ssl.create_default_context(),
         )
     else:
-        connection = http.client.HTTPConnection(
-            parsed.hostname, parsed.port or 80, timeout=timeout_s
+        connection = _PinnedHTTPConnection(
+            parsed.hostname,
+            connect_ip,
+            parsed.port or 80,
+            timeout=timeout_s,
         )
 
     try:
@@ -122,7 +206,7 @@ def proxy_mcp_request(
             headers=resp_headers,
             body=resp_body,
         )
-    except (TimeoutError, OSError, http.client.HTTPException) as exc:
+    except (TimeoutError, OSError, http.client.HTTPException, ssl.SSLError) as exc:
         audit_event(
             logger,
             "mcp_proxy_upstream_error",

@@ -1,4 +1,9 @@
-"""Crash-safe durable OAuth client/refresh-token state for single-user relay."""
+"""Atomic durable OAuth client/refresh-token state for single-user relay.
+
+Writes use a same-directory temp file, fsync the file contents, replace into
+place, then fsync the parent directory so the directory entry is durable across
+process crash and typical system crash on local filesystems.
+"""
 
 from __future__ import annotations
 
@@ -103,6 +108,12 @@ class DurableOAuthStore:
             os.chmod(tmp_name, 0o600)
             os.replace(tmp_name, self.path)
             tmp_name = None
+            # Durability of the directory entry after rename.
+            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
             os.chmod(self.path, 0o600)
             _assert_safe_file_mode(self.path)
         except OAuthStateError:

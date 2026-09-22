@@ -17,10 +17,11 @@ operations:
   production_oriented: false
   runbook_required: false
   incident_response_required: false
-  persistent_state: false
+  # Public/non-loopback OAuth requires durable client + refresh state on disk.
+  persistent_state: true
   runbook_paths: []
   health_command: ''
-  backup_command: ''
-  restore_test_command: ''
+  backup_command: scripts/backup-oauth-state.sh
+  restore_test_command: scripts/restore-test-oauth-state.sh
   upgrade_command: ''
   rollback_command: ''

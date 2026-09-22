@@ -241,7 +241,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         try:
             oauth = self._require_oauth()
             params = self._qs_first(qs)
-            result = oauth.begin_authorization(params)
+            result = oauth.begin_authorization(params, source=self._client_source())
             if isinstance(result, dict):
                 # Error redirect to client.
                 from urllib.parse import urlencode, urlparse, urlunparse

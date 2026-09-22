@@ -1,7 +1,7 @@
 engineering_system:
-  version: 1.6.1
+  version: 1.6.2
   mode: adopted
-  baseline: fe0c05d0508564512b3eaae96e35a84699d4c728
+  baseline: d505e2813cfc0d2ac58d063ec3e4eb4828734885
   ci_mode: shared
   native_ci_workflows: []
   merge_gate_status: advisory
@@ -17,7 +17,6 @@ operations:
   production_oriented: false
   runbook_required: false
   incident_response_required: false
-  # Public/non-loopback OAuth requires durable client + refresh state on disk.
   persistent_state: true
   runbook_paths: []
   health_command: ''

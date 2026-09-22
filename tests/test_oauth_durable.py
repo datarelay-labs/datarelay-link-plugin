@@ -380,52 +380,99 @@ class DurableOAuthStateTests(unittest.TestCase):
         self.assertNotIn(first.request_id, svc.pending)
         self.assertIn(second.request_id, svc.pending)
 
-    def test_pending_capacity_evicts_oldest_not_legitimate(self) -> None:
+    def test_pending_per_client_capacity_rejects_without_eviction(self) -> None:
         svc = OAuthService(self.config)  # type: ignore[arg-type]
-        churn_client = self._register(svc, source="198.51.100.1")
+        client_id = self._register(svc, source="198.51.100.1")
+        kept: list[str] = []
         for i in range(MAX_PENDING_PER_CLIENT):
-            pending = self._authorize(svc, churn_client, source=f"198.51.100.{i + 10}")
+            pending = self._authorize(svc, client_id, source=f"198.51.100.{i + 10}")
             assert not isinstance(pending, dict)
-        self.assertEqual(
-            sum(1 for p in svc.pending.values() if p.client_id == churn_client),
-            MAX_PENDING_PER_CLIENT,
+            kept.append(pending.request_id)
+        self.assertEqual(len(svc.pending), MAX_PENDING_PER_CLIENT)
+        with self.assertRaises(OAuthError) as ctx:
+            self._authorize(svc, client_id, source="198.51.100.99")
+        self.assertEqual(ctx.exception.error, "temporarily_unavailable")
+        self.assertEqual(ctx.exception.status, 429)
+        for request_id in kept:
+            self.assertIn(request_id, svc.pending)
+        # A different client can still admit while this client is at cap.
+        other = self._register(svc, source="203.0.113.50")
+        other_pending = self._authorize(svc, other, source="203.0.113.51")
+        assert not isinstance(other_pending, dict)
+        for request_id in kept:
+            self.assertIn(request_id, svc.pending)
+
+    def test_same_public_client_distributed_churn_preserves_consent(self) -> None:
+        """Same public client_id churn from many sources must not drop live consent."""
+        svc = OAuthService(self.config)  # type: ignore[arg-type]
+        client_id = self._register(svc, source="198.51.100.1")
+        verifier = "same-client-consent-verifier-value-0001"
+        digest = hashlib.sha256(verifier.encode("ascii")).digest()
+        challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        legitimate = svc.begin_authorization(
+            {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": self.redirect,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "resource": self.resource,
+            },
+            source="203.0.113.10",
         )
-        oldest_for_churn = min(
-            (
-                (rid, p)
-                for rid, p in svc.pending.items()
-                if p.client_id == churn_client
-            ),
-            key=lambda item: (item[1].expires_at, item[0]),
-        )[0]
-        legitimate_client = self._register(svc, source="203.0.113.50")
-        legitimate = self._authorize(svc, legitimate_client, source="203.0.113.51")
         assert not isinstance(legitimate, dict)
-        self.assertLessEqual(len(svc.pending), MAX_PENDING_AUTHORIZATIONS)
-        self.assertIn(legitimate.request_id, svc.pending)
-        # Further churn from the same client trims that client only.
-        extra = self._authorize(svc, churn_client, source="198.51.100.99")
-        assert not isinstance(extra, dict)
-        self.assertIn(legitimate.request_id, svc.pending)
-        self.assertNotIn(oldest_for_churn, svc.pending)
+        legitimate_id = legitimate.request_id
+
+        rejected = 0
+        for i in range(MAX_PENDING_PER_CLIENT * 8):
+            try:
+                pending = self._authorize(
+                    svc, client_id, source=f"192.0.2.{(i % 250) + 1}"
+                )
+                assert not isinstance(pending, dict)
+            except OAuthError as exc:
+                self.assertEqual(exc.error, "temporarily_unavailable")
+                self.assertEqual(exc.status, 429)
+                rejected += 1
+        self.assertGreater(rejected, 0)
+        self.assertIn(legitimate_id, svc.pending)
         self.assertLessEqual(
-            sum(1 for p in svc.pending.values() if p.client_id == churn_client),
+            sum(1 for p in svc.pending.values() if p.client_id == client_id),
             MAX_PENDING_PER_CLIENT,
         )
+        self.assertLessEqual(len(svc.pending), MAX_PENDING_AUTHORIZATIONS)
+
+        location = svc.complete_authorization(
+            request_id=legitimate_id,
+            owner_secret=self.owner_secret,
+            decision="approve",
+            source="127.0.0.1",
+        )
+        code = parse_qs(urlparse(location).query)["code"][0]
+        tokens = svc.exchange_token(
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": self.redirect,
+                "client_id": client_id,
+                "code_verifier": verifier,
+                "resource": self.resource,
+            }
+        )
+        self.assertIn("access_token", tokens)
+        self.assertIn("refresh_token", tokens)
 
     def test_cross_client_pending_churn_cannot_evict_legitimate(self) -> None:
-        """One client's authorize flood must not displace another's live consent."""
+        """Other clients filling global capacity must not displace live consent."""
         svc = OAuthService(self.config)  # type: ignore[arg-type]
         legitimate_client = self._register(svc, source="203.0.113.1")
         legitimate = self._authorize(svc, legitimate_client, source="203.0.113.2")
         assert not isinstance(legitimate, dict)
         # Fill remaining global capacity via many distinct churn clients/sources.
-        churn_ids: list[str] = []
         created = 0
         source_i = 0
         while len(svc.pending) < MAX_PENDING_AUTHORIZATIONS:
             churn = self._register(svc, source=f"198.51.100.{(source_i % 200) + 1}")
-            churn_ids.append(churn)
             for _ in range(MAX_PENDING_PER_CLIENT):
                 if len(svc.pending) >= MAX_PENDING_AUTHORIZATIONS:
                     break
@@ -439,19 +486,14 @@ class DurableOAuthStateTests(unittest.TestCase):
                 self.fail("could not fill pending capacity for regression")
         self.assertEqual(len(svc.pending), MAX_PENDING_AUTHORIZATIONS)
         self.assertIn(legitimate.request_id, svc.pending)
-        # Additional churn from an existing attacker client must not drop the owner prompt.
-        attacker = churn_ids[0]
-        before = set(svc.pending)
-        extra = self._authorize(svc, attacker, source="192.0.2.200")
-        assert not isinstance(extra, dict)
+        # Additional authorize at global capacity must reject, not evict.
+        attacker = self._register(svc, source="192.0.2.50")
+        with self.assertRaises(OAuthError) as ctx:
+            self._authorize(svc, attacker, source="192.0.2.200")
+        self.assertEqual(ctx.exception.error, "temporarily_unavailable")
+        self.assertEqual(ctx.exception.status, 429)
         self.assertIn(legitimate.request_id, svc.pending)
-        self.assertLessEqual(len(svc.pending), MAX_PENDING_AUTHORIZATIONS)
-        # Evicted entry belonged to a churn client, not the legitimate prompt.
-        evicted = before - set(svc.pending)
-        self.assertTrue(evicted)
-        for rid in evicted:
-            # Either removed before re-add, or replaced; legitimate must remain.
-            self.assertNotEqual(rid, legitimate.request_id)
+        self.assertEqual(len(svc.pending), MAX_PENDING_AUTHORIZATIONS)
 
     def test_authorize_does_not_persist_or_refresh_inactive_ttl(self) -> None:
         svc = OAuthService(self.config)  # type: ignore[arg-type]
@@ -468,9 +510,17 @@ class DurableOAuthStateTests(unittest.TestCase):
     def test_pending_churn_cannot_unboundedly_grow(self) -> None:
         svc = OAuthService(self.config)  # type: ignore[arg-type]
         client_id = self._register(svc)
+        admitted = 0
         for i in range(MAX_PENDING_AUTHORIZATIONS * 3):
-            pending = self._authorize(svc, client_id, source=f"198.51.100.{(i % 200) + 1}")
-            assert not isinstance(pending, dict)
+            try:
+                pending = self._authorize(
+                    svc, client_id, source=f"198.51.100.{(i % 200) + 1}"
+                )
+                assert not isinstance(pending, dict)
+                admitted += 1
+            except OAuthError as exc:
+                self.assertEqual(exc.error, "temporarily_unavailable")
+        self.assertEqual(admitted, MAX_PENDING_PER_CLIENT)
         self.assertLessEqual(len(svc.pending), MAX_PENDING_AUTHORIZATIONS)
         self.assertLessEqual(
             sum(1 for p in svc.pending.values() if p.client_id == client_id),
@@ -483,6 +533,8 @@ class DurableOAuthStateTests(unittest.TestCase):
         for _ in range(AUTHZ_RATE_LIMIT):
             pending = self._authorize(svc, client_id, source="203.0.113.77")
             assert not isinstance(pending, dict)
+            # Free per-client slot so the per-source limiter is what trips.
+            del svc.pending[pending.request_id]
         with self.assertRaises(OAuthError) as ctx:
             self._authorize(svc, client_id, source="203.0.113.77")
         self.assertEqual(ctx.exception.error, "temporarily_unavailable")

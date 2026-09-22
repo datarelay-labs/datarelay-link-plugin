@@ -44,9 +44,11 @@ Future multi-user / production identity service is out of scope.
   inactive-client cap, and are evicted oldest-first at capacity; clients with a
   live non-revoked refresh token are not evicted by ordinary cleanup.
 - Pending authorize requests are in-memory only, expire with the auth-code TTL,
-  are swept before admit, capped globally and per-client, and evict from the
-  fullest clients first so one churning client cannot displace an unrelated live
-  consent prompt. Per-source authorize create rate limits further bound churn.
+  are swept before admit, and are capped globally and per-client. Unexpired
+  pending is never evicted to admit a new unauthenticated authorize (including
+  same-public-client churn); excess requests are rejected/throttled so a live
+  owner consent remains approvable. Per-source authorize create rate limits
+  further bound churn.
 - Clients referenced by an unexpired pending authorization are not removed by
   inactive DCR cleanup (no durable authorize touch / fsync).
 - Authorize validation does not update durable `last_used_at` / fsync state;

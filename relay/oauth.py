@@ -36,8 +36,9 @@ MAX_DCR_CLIENTS = 64
 MAX_INACTIVE_DCR_CLIENTS = 16
 INACTIVE_CLIENT_TTL_S = 60 * 60
 # In-memory pending authorize requests (pre-consent). Expired entries are swept
-# before admit. Per-client caps and fullest-client eviction keep one churning
-# client/source from displacing unrelated live consent prompts. A per-source
+# before admit. Unexpired pending is never evicted to make room for a new
+# unauthenticated authorize: per-client and global caps reject/throttle instead,
+# so same-public-client churn cannot displace a live owner consent. A per-source
 # create rate limit further bounds unauthenticated authorize churn.
 MAX_PENDING_AUTHORIZATIONS = 32
 MAX_PENDING_PER_CLIENT = 4
@@ -428,73 +429,19 @@ class OAuthService:
     def _pending_count_for_client_locked(self, client_id: str) -> int:
         return sum(1 for p in self.pending.values() if p.client_id == client_id)
 
-    def _evict_oldest_pending_for_client_locked(self, client_id: str) -> str | None:
-        candidates = [
-            (request_id, pending)
-            for request_id, pending in self.pending.items()
-            if pending.client_id == client_id
-        ]
-        if not candidates:
-            return None
-        oldest_id = min(candidates, key=lambda item: (item[1].expires_at, item[0]))[0]
-        del self.pending[oldest_id]
-        return oldest_id
+    def _cleanup_pending_locked(self, *, now: float) -> list[str]:
+        """Sweep expired pending authorizations only.
 
-    def _evict_fullest_pending_locked(self) -> str | None:
-        """Evict oldest pending among clients holding the most live pending slots."""
-        if not self.pending:
-            return None
-        counts: dict[str, int] = {}
-        for pending in self.pending.values():
-            counts[pending.client_id] = counts.get(pending.client_id, 0) + 1
-        max_count = max(counts.values())
-        candidates = [
-            (request_id, pending)
-            for request_id, pending in self.pending.items()
-            if counts[pending.client_id] == max_count
-        ]
-        oldest_id = min(candidates, key=lambda item: (item[1].expires_at, item[0]))[0]
-        del self.pending[oldest_id]
-        return oldest_id
-
-    def _cleanup_pending_locked(
-        self,
-        *,
-        now: float,
-        reserve_slots: int = 0,
-        for_client_id: str | None = None,
-    ) -> list[str]:
-        """Sweep expired pending; enforce per-client and global bounds.
-
-        ``reserve_slots`` leaves room for an incoming authorize (typically 1).
-        When ``for_client_id`` is set, that client's own pending is trimmed to
-        ``MAX_PENDING_PER_CLIENT - reserve_slots`` before global eviction.
-        Global overflow evicts from the fullest clients first so one churning
-        client cannot displace an unrelated live consent prompt.
+        Unexpired pending is never evicted to admit a new unauthenticated
+        authorize request. Per-client / global capacity is enforced by rejecting
+        new admits in ``begin_authorization`` so live consent cannot be displaced.
         Pending state is in-memory only and is never written to durable store.
         """
-        if reserve_slots < 0:
-            raise ValueError("reserve_slots must be >= 0")
         removed: list[str] = []
         for request_id, pending in list(self.pending.items()):
             if pending.expires_at < now:
                 del self.pending[request_id]
                 removed.append(request_id)
-
-        if for_client_id is not None:
-            per_client_budget = max(0, MAX_PENDING_PER_CLIENT - reserve_slots)
-            while self._pending_count_for_client_locked(for_client_id) > per_client_budget:
-                victim = self._evict_oldest_pending_for_client_locked(for_client_id)
-                if victim is None:
-                    break
-                removed.append(victim)
-
-        budget = max(0, MAX_PENDING_AUTHORIZATIONS - reserve_slots)
-        while len(self.pending) > budget:
-            victim = self._evict_fullest_pending_locked()
-            if victim is None:
-                break
-            removed.append(victim)
         return removed
 
     @property
@@ -727,9 +674,20 @@ class OAuthService:
             # Bound in-memory pending only. Do not touch last_used_at / durable
             # state here: authorize is unauthenticated and would amplify fsync
             # I/O while refreshing inactive-client TTL under churn.
-            self._cleanup_pending_locked(
-                now=time.time(), reserve_slots=1, for_client_id=client_id
-            )
+            # Sweep expired only — never evict live consent to admit churn.
+            self._cleanup_pending_locked(now=time.time())
+            if self._pending_count_for_client_locked(client_id) >= MAX_PENDING_PER_CLIENT:
+                raise OAuthError(
+                    "temporarily_unavailable",
+                    "authorization request limit for client exceeded",
+                    status=429,
+                )
+            if len(self.pending) >= MAX_PENDING_AUTHORIZATIONS:
+                raise OAuthError(
+                    "temporarily_unavailable",
+                    "authorization request capacity exceeded",
+                    status=429,
+                )
             self.pending[request_id] = pending
             self._authz_limiter.record(source)
         return pending

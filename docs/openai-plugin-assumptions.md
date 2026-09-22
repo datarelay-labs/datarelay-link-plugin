@@ -1,14 +1,16 @@
-# Verified OpenAI / Agent Plugins assumptions (Packet 1)
+# Verified OpenAI / Agent Plugins assumptions
 
 Sources consulted (official only):
 
 - [Package your plugin](https://developers.openai.com/plugins/build/plugins) (OpenAI Developers)
 - [Build an MCP server](https://developers.openai.com/plugins/build/mcp-server) (OpenAI Developers)
+- [Authentication (Apps SDK / Plugins)](https://developers.openai.com/apps-sdk/build/auth) (OpenAI Developers)
 - [Apps SDK quickstart](https://developers.openai.com/apps-sdk/quickstart) (OpenAI Developers)
 - [Agent Plugins specification 1.0.0](https://agent-plugins.org/specification)
+- [MCP Authorization (2025-11-25)](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
 - [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports)
 
-Recorded: 2026-09-22.
+Recorded: 2026-09-22 (Packet 2 OAuth re-check).
 
 ## Packaging
 
@@ -18,7 +20,7 @@ Recorded: 2026-09-22.
 4. Remote MCP servers are declared in root `mcp.json` with `type: "streamable-http"` and an absolute `url`.
 5. Literal credentials must **not** appear in `mcp.json` headers; OAuth / credential storage is client-managed in Agent Plugins v1.
 6. Public submission requires a stable public **HTTPS** MCP endpoint (typically ending in `/mcp`). Local/dev may use loopback HTTP for PoC only.
-7. Custom UI / skills are optional for Remote MCP-only plugins. Packet 1 ships no skills and no custom UI.
+7. Custom UI / skills are optional for Remote MCP-only plugins. This repo ships no skills and no custom UI.
 
 ## MCP wire behavior
 
@@ -28,8 +30,18 @@ Recorded: 2026-09-22.
 4. Tool metadata (name, description, inputSchema, annotations, securitySchemes) is part of the contract and must pass through unchanged by a relay.
 5. Authorization is enforced by the MCP server on every tool call; a relay must not reinterpret or cache authz decisions.
 
+## OAuth / authentication (Packet 2)
+
+1. Authenticated remote MCP servers must implement OAuth 2.1 per the MCP authorization spec.
+2. Host protected resource metadata at `/.well-known/oauth-protected-resource` (and/or advertise it via `WWW-Authenticate` on `401`).
+3. Publish authorization-server metadata (`/.well-known/oauth-authorization-server` or OIDC discovery).
+4. Authorization Code + PKCE with `S256` is required; advertise `code_challenge_methods_supported: ["S256"]`.
+5. Echo the `resource` parameter (RFC 8707) through authorize and token requests; validate audience on each MCP request.
+6. Client identification options: CIMD, DCR, or predefined clients. This PoC implements **DCR** only; CIMD is a later optimization.
+7. ChatGPT tool linking also expects per-tool `securitySchemes` plus runtime `_meta["mcp/www_authenticate"]` from the **upstream** MCP server for tool-level linking UI; the relay must pass those through unchanged. When the relay itself rejects an unauthenticated/insufficient-scope MCP JSON-RPC request, it emits HTTP 401/403 with a Bearer `WWW-Authenticate` challenge (`resource_metadata`, `scope`, `error`, `error_description`) and a coherent `_meta["mcp/www_authenticate"]` payload so ChatGPT can surface connect/reconnect UI.
+
 ## DataRelay Link Plugin implications
 
 1. This repository publishes the ChatGPT Plus-facing Plugin package and a public relay seam.
 2. Upstream DRLink Server remains the authorization source of truth on every `tools/call`.
-3. Packet 1 points the package at a **local/dev relay URL**; production `mcp.datarelay.run` and Plugin Directory submission are out of scope.
+3. Package URL remains a configurable local/dev or deploy-time HTTPS endpoint; production `mcp.datarelay.run` and Plugin Directory submission are out of scope.

@@ -1,14 +1,28 @@
-"""Dev-only Plugin identity ↔ upstream binding seam."""
+"""Plugin identity ↔ upstream binding seam (mock + OAuth)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import RelayConfig
+from .config import AUTH_MODE_MOCK, AUTH_MODE_OAUTH, RelayConfig
+from .oauth import OAuthError, OAuthService
 
 
 class BindingError(PermissionError):
     """Inbound identity is not bound to an upstream."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 401,
+        oauth_error: str | None = None,
+        oauth_description: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.oauth_error = oauth_error
+        self.oauth_description = oauth_description
 
 
 @dataclass(frozen=True)
@@ -19,6 +33,20 @@ class UpstreamBinding:
     allow_loopback_upstream: bool
     upstream_authorization: str | None
     plugin_subject: str
+
+
+def _upstream_binding(config: RelayConfig, *, binding_id: str, subject: str) -> UpstreamBinding:
+    upstream_auth = None
+    if config.upstream_token:
+        upstream_auth = f"Bearer {config.upstream_token}"
+    return UpstreamBinding(
+        binding_id=binding_id,
+        upstream_url=config.upstream_url,
+        upstream_connect_ips=config.upstream_connect_ips,
+        allow_loopback_upstream=config.allow_loopback_upstream,
+        upstream_authorization=upstream_auth,
+        plugin_subject=subject,
+    )
 
 
 class MockBindingStore:
@@ -44,17 +72,8 @@ class MockBindingStore:
         if authorization_header != expected:
             raise BindingError("unbound or invalid plugin identity")
 
-        upstream_auth = None
-        if self._config.upstream_token:
-            upstream_auth = f"Bearer {self._config.upstream_token}"
-
-        return UpstreamBinding(
-            binding_id=self._binding_id,
-            upstream_url=self._config.upstream_url,
-            upstream_connect_ips=self._config.upstream_connect_ips,
-            allow_loopback_upstream=self._config.allow_loopback_upstream,
-            upstream_authorization=upstream_auth,
-            plugin_subject=self._subject,
+        return _upstream_binding(
+            self._config, binding_id=self._binding_id, subject=self._subject
         )
 
     def revoke(self, binding_id: str) -> None:
@@ -62,3 +81,48 @@ class MockBindingStore:
 
     def reconnect(self, binding_id: str) -> None:
         self._revoked.discard(binding_id)
+
+
+class BindingResolver:
+    """Resolve inbound ChatGPT/Plugin credentials to the single upstream binding.
+
+    OAuth mode never falls back to the mock plugin token.
+    """
+
+    def __init__(self, config: RelayConfig, oauth: OAuthService | None = None) -> None:
+        self._config = config
+        self._mock = MockBindingStore(config)
+        self._oauth = oauth
+
+    @property
+    def mock(self) -> MockBindingStore:
+        return self._mock
+
+    @property
+    def oauth(self) -> OAuthService | None:
+        return self._oauth
+
+    def resolve(self, authorization_header: str | None) -> UpstreamBinding:
+        if self._config.auth_mode == AUTH_MODE_OAUTH:
+            if self._oauth is None:
+                raise BindingError("oauth not configured")
+            # Never accept mock bearer tokens in production OAuth mode.
+            try:
+                token = self._oauth.validate_bearer(authorization_header)
+            except OAuthError as exc:
+                raise BindingError(
+                    str(exc),
+                    status=exc.status,
+                    oauth_error=exc.error,
+                    oauth_description=exc.description,
+                ) from exc
+            return _upstream_binding(
+                self._config,
+                binding_id="oauth-binding-1",
+                subject=token.subject,
+            )
+
+        if self._config.auth_mode == AUTH_MODE_MOCK:
+            return self._mock.resolve(authorization_header)
+
+        raise BindingError("unsupported auth mode")

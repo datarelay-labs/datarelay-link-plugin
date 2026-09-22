@@ -33,15 +33,17 @@ See [docs/architecture.md](docs/architecture.md) and [docs/openai-plugin-assumpt
 
 ## Local relay (PoC)
 
+### Mock mode (loopback / local tests)
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Terminal A: mock or real upstream MCP (example uses tests' contract)
 export DRLINK_RELAY_UPSTREAM_URL="http://127.0.0.1:9000/mcp"
 export DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM=1
 export DRLINK_RELAY_UPSTREAM_TOKEN="replace-me"
+export DRLINK_RELAY_AUTH_MODE=mock
 export DRLINK_RELAY_MOCK_PLUGIN_TOKEN="dev-plugin-token"
 export DRLINK_RELAY_BIND=127.0.0.1
 export DRLINK_RELAY_PORT=8741
@@ -49,13 +51,40 @@ export DRLINK_RELAY_PORT=8741
 PYTHONPATH=. python3 -m relay
 ```
 
-Health: `GET http://127.0.0.1:8741/health`
-
 MCP: `POST http://127.0.0.1:8741/mcp` with `Authorization: Bearer dev-plugin-token`
 
-The default mock token is loopback-only. Non-loopback bind requires both `DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND=1` and an explicit non-default `DRLINK_RELAY_MOCK_PLUGIN_TOKEN`.
+### OAuth mode (single-user ChatGPT-compatible PoC)
 
-`mcp.json` points at the local PoC relay URL. Production HTTPS (`mcp.datarelay.run`) is out of scope for Packet 1.
+```bash
+export DRLINK_RELAY_UPSTREAM_URL="http://127.0.0.1:9000/mcp"
+export DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM=1
+export DRLINK_RELAY_UPSTREAM_TOKEN="replace-me"
+export DRLINK_RELAY_AUTH_MODE=oauth
+export DRLINK_RELAY_PUBLIC_BASE_URL="http://127.0.0.1:8741"
+export DRLINK_RELAY_OWNER_APPROVAL_SECRET="replace-with-long-runtime-secret"
+export DRLINK_RELAY_BIND=127.0.0.1
+export DRLINK_RELAY_PORT=8741
+
+PYTHONPATH=. python3 -m relay
+```
+
+Discovery:
+
+- `GET /.well-known/oauth-protected-resource`
+- `GET /.well-known/oauth-authorization-server`
+
+Owner consent uses the runtime approval secret (never commit it). Public HTTPS
+deployment URLs remain configurable; this repo does not claim public Plugin
+availability.
+
+Health: `GET /health` (reports `auth_mode`, never secrets).
+
+The default mock token is loopback-only. Non-loopback bind should use `oauth`
+mode. Legacy mock-on-public requires both `DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND=1`
+and an explicit non-default `DRLINK_RELAY_MOCK_PLUGIN_TOKEN`.
+
+`mcp.json` points at the local PoC relay URL. Production HTTPS (`mcp.datarelay.run`)
+and Plugin Directory submission remain out of scope.
 
 ## Tests
 
@@ -66,7 +95,8 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 
 ## Auth seam
 
-Packet 1 includes a **dev-only mock binding** (`relay/binding.py`). See [docs/auth-seam.md](docs/auth-seam.md). Do not treat mock tokens as production credentials.
+See [docs/auth-seam.md](docs/auth-seam.md) for mock vs single-user OAuth PoC vs
+future multi-user identity. Do not treat mock tokens as production credentials.
 
 ## Security constraints
 

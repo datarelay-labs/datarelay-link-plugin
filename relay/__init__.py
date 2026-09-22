@@ -1,3 +1,3 @@
-"""DataRelay Link single-user MCP relay (Packet 1 PoC)."""
+"""DataRelay Link single-user MCP relay (OAuth 2.1 PoC)."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -358,7 +358,7 @@ class RelayTestCase(unittest.TestCase):
         }
         with self.assertRaises(ConfigError) as ctx_missing_override:
             load_config({**base, "DRLINK_RELAY_MOCK_PLUGIN_TOKEN": DEFAULT_MOCK_PLUGIN_TOKEN})
-        self.assertIn("NON_LOOPBACK_BIND", str(ctx_missing_override.exception))
+        self.assertIn("oauth", str(ctx_missing_override.exception).lower())
 
         with self.assertRaises(ConfigError) as ctx_default_token:
             load_config(
@@ -379,6 +379,7 @@ class RelayTestCase(unittest.TestCase):
         )
         self.assertEqual(cfg.mock_plugin_token, "explicit-strong-dev-token")
         self.assertEqual(cfg.bind_host, "0.0.0.0")
+        self.assertEqual(cfg.auth_mode, "mock")
 
     def test_dns_rebinding_uses_pinned_connect_ip(self) -> None:
         # Bind-time resolution returns a public IP; later hostname rebinding must

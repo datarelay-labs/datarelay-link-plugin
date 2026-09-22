@@ -16,6 +16,10 @@ class ConfigError(ValueError):
 DEFAULT_MOCK_PLUGIN_TOKEN = "dev-plugin-token"
 
 
+AUTH_MODE_MOCK = "mock"
+AUTH_MODE_OAUTH = "oauth"
+
+
 @dataclass(frozen=True)
 class RelayConfig:
     bind_host: str
@@ -26,6 +30,11 @@ class RelayConfig:
     allow_loopback_upstream: bool
     mock_plugin_token: str
     request_timeout_s: float
+    auth_mode: str
+    public_base_url: str | None
+    resource_url: str | None
+    owner_approval_secret: str | None
+    allow_non_loopback_bind: bool
 
 
 _BLOCKED_HOSTNAMES = {"metadata.google.internal", "metadata"}
@@ -176,6 +185,10 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
     if timeout_s <= 0:
         raise ConfigError("DRLINK_RELAY_TIMEOUT_S must be positive")
 
+    auth_mode = (env.get("DRLINK_RELAY_AUTH_MODE") or AUTH_MODE_MOCK).strip().lower()
+    if auth_mode not in {AUTH_MODE_MOCK, AUTH_MODE_OAUTH}:
+        raise ConfigError("DRLINK_RELAY_AUTH_MODE must be 'mock' or 'oauth'")
+
     explicit_mock_token = env.get("DRLINK_RELAY_MOCK_PLUGIN_TOKEN")
     if explicit_mock_token is None:
         mock_plugin_token = DEFAULT_MOCK_PLUGIN_TOKEN
@@ -187,17 +200,75 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
     allow_non_loopback_bind = env.get(
         "DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND", ""
     ).strip() in {"1", "true", "TRUE", "yes", "YES"}
-    if not _is_loopback_host(bind_host):
-        if not allow_non_loopback_bind:
+
+    public_base_url: str | None = None
+    resource_url: str | None = None
+    owner_approval_secret: str | None = None
+
+    if auth_mode == AUTH_MODE_OAUTH:
+        public_raw = (env.get("DRLINK_RELAY_PUBLIC_BASE_URL") or "").strip().rstrip("/")
+        if not public_raw:
             raise ConfigError(
-                "non-loopback bind requires DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND=1 "
-                "(dev-only mock binding is not safe on public interfaces)"
+                "oauth mode requires DRLINK_RELAY_PUBLIC_BASE_URL "
+                "(canonical public HTTPS origin of the relay)"
             )
-        if mock_plugin_token == DEFAULT_MOCK_PLUGIN_TOKEN:
+        public_parsed = urlparse(public_raw)
+        if public_parsed.scheme not in {"http", "https"} or not public_parsed.netloc:
+            raise ConfigError("DRLINK_RELAY_PUBLIC_BASE_URL must be an absolute http(s) URL")
+        if public_parsed.scheme == "http" and not _is_loopback_host(
+            public_parsed.hostname or ""
+        ):
+            raise ConfigError(
+                "non-loopback DRLINK_RELAY_PUBLIC_BASE_URL must use https"
+            )
+        if public_parsed.path not in {"", "/"}:
+            raise ConfigError(
+                "DRLINK_RELAY_PUBLIC_BASE_URL must be an origin (no path); "
+                "set DRLINK_RELAY_RESOURCE_URL for a non-default MCP resource URI"
+            )
+        public_base_url = public_raw
+
+        resource_raw = (env.get("DRLINK_RELAY_RESOURCE_URL") or "").strip().rstrip("/")
+        if resource_raw:
+            resource_parsed = urlparse(resource_raw)
+            if resource_parsed.scheme not in {"http", "https"} or not resource_parsed.netloc:
+                raise ConfigError("DRLINK_RELAY_RESOURCE_URL must be an absolute http(s) URL")
+            resource_url = resource_raw
+        else:
+            resource_url = f"{public_base_url}/mcp"
+
+        owner_secret = env.get("DRLINK_RELAY_OWNER_APPROVAL_SECRET")
+        if owner_secret is None or not owner_secret.strip():
+            raise ConfigError(
+                "oauth mode requires DRLINK_RELAY_OWNER_APPROVAL_SECRET "
+                "(runtime owner approval secret; never commit it)"
+            )
+        owner_approval_secret = owner_secret.strip()
+        if len(owner_approval_secret) < 16:
+            raise ConfigError(
+                "DRLINK_RELAY_OWNER_APPROVAL_SECRET must be at least 16 characters"
+            )
+
+    if not _is_loopback_host(bind_host):
+        if auth_mode == AUTH_MODE_OAUTH:
+            # OAuth is the supported production-mode path for public listeners.
+            pass
+        elif not allow_non_loopback_bind:
+            raise ConfigError(
+                "non-loopback bind requires DRLINK_RELAY_AUTH_MODE=oauth "
+                "(or legacy DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND=1 for local mock only)"
+            )
+        elif mock_plugin_token == DEFAULT_MOCK_PLUGIN_TOKEN:
             raise ConfigError(
                 "non-loopback bind rejects the default mock plugin token; "
                 "set an explicit strong DRLINK_RELAY_MOCK_PLUGIN_TOKEN"
             )
+    elif auth_mode == AUTH_MODE_MOCK and allow_non_loopback_bind:
+        # Flag is irrelevant on loopback; ignore.
+        pass
+
+    # OAuth mode must never silently accept mock bearer tokens.
+    # Mock mode remains available for loopback/local tests (and Packet 1 override).
 
     return RelayConfig(
         bind_host=bind_host,
@@ -208,4 +279,9 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
         allow_loopback_upstream=allow_loopback,
         mock_plugin_token=mock_plugin_token,
         request_timeout_s=timeout_s,
+        auth_mode=auth_mode,
+        public_base_url=public_base_url,
+        resource_url=resource_url,
+        owner_approval_secret=owner_approval_secret,
+        allow_non_loopback_bind=allow_non_loopback_bind,
     )

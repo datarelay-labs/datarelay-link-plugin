@@ -27,4 +27,17 @@ This repository must not modify `datarelay-labs/datarelay-link`. Core MCP intero
 - Preserve/forward MCP protocol headers (`Mcp-Session-Id`, `Last-Event-ID`, `Accept`, `Content-Type`).
 - Fail closed when upstream is missing, invalid, or unreachable.
 - Health endpoint is separate from `/mcp` and never exposes secrets.
-- Auth seam: Plugin-side identity → binding → upstream credential exchange (dev mock only in Packet 1).
+- Auth seam: Plugin-side identity → binding → upstream credential exchange.
+
+## Packet 2 auth contract (single-user OAuth 2.1)
+
+- Auth modes: `mock` (loopback/local) and `oauth` (ChatGPT-compatible PoC).
+- OAuth mode hosts `/.well-known/oauth-protected-resource` and
+  `/.well-known/oauth-authorization-server` on the relay origin.
+- Built-in AS: Authorization Code + PKCE S256, DCR (public clients), token +
+  revoke endpoints, owner consent UI gated by runtime approval secret.
+- Access tokens are resource-bound to the configured MCP canonical URL and
+  validated on every `/mcp` request; inbound ChatGPT tokens are never forwarded
+  upstream.
+- Unauthenticated `/mcp` requests in OAuth mode return `401` with
+  `WWW-Authenticate` `resource_metadata` (RFC 9728).

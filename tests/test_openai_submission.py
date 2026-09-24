@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import threading
 import unittest
 from urllib import error, request
 
-from packaging.readiness import PackageError, evaluate, render_mcp_document, validate_mcp_url
+from plugin_readiness.readiness import PackageError, evaluate, render_mcp_document, validate_mcp_url
 from relay.config import ConfigError, load_config
 from relay.server import create_server
 from tests.test_relay_poc import ROOT, _free_port
@@ -31,6 +34,25 @@ def _oauth_env(port: int, *, challenge: str | None = None) -> dict[str, str]:
 
 
 class PackageContractTests(unittest.TestCase):
+    def test_repo_root_does_not_shadow_packaging_version(self) -> None:
+        env = os.environ.copy()
+        env["PYTHONPATH"] = "."
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from packaging.version import Version; print(Version('1.2.3'))",
+            ],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "1.2.3")
+        self.assertFalse((ROOT / "packaging").exists())
+
     def test_canonical_manifest_is_codex_plugin_without_inline_extension(self) -> None:
         canonical = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
         portable = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))

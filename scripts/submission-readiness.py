@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from packaging.readiness import PackageError, evaluate  # noqa: E402
+from plugin_readiness.readiness import PackageError, evaluate  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:

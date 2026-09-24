@@ -16,6 +16,8 @@ from .binding import UpstreamBinding
 from .config import ConfigError, assert_connect_ip_allowed
 
 # Headers forwarded from client → upstream (case-insensitive match).
+# Authorization is intentionally excluded: upstream auth comes only from the binding.
+# Mcp-Method / Mcp-Name are required by DRLink MCP Bridge header/envelope checks.
 _FORWARD_REQUEST_HEADERS = {
     "accept",
     "accept-encoding",
@@ -23,6 +25,8 @@ _FORWARD_REQUEST_HEADERS = {
     "mcp-session-id",
     "last-event-id",
     "mcp-protocol-version",
+    "mcp-method",
+    "mcp-name",
 }
 
 # Headers forwarded from upstream → client.

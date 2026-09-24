@@ -649,12 +649,77 @@ class OAuthRelayTestCase(unittest.TestCase):
             "POST",
             "/mcp",
             body={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-            headers={"Authorization": f"Bearer {token['access_token']}"},
+            headers={
+                "Authorization": f"Bearer {token['access_token']}",
+                "MCP-Protocol-Version": "2026-07-28",
+                "Mcp-Method": "tools/list",
+                "Mcp-Name": "tools/list",
+            },
         )
         self.assertTrue(self.upstream.requests)
-        upstream_auth = self.upstream.requests[-1]["headers"].get("Authorization")
+        upstream_headers = self.upstream.requests[-1]["headers"]
+        upstream_auth = upstream_headers.get("Authorization")
         self.assertEqual(upstream_auth, "Bearer upstream-secret-token")
         self.assertNotEqual(upstream_auth, f"Bearer {token['access_token']}")
+        # DRLink MCP Bridge requires these envelope headers; relay must forward them.
+        header_map = {k.lower(): v for k, v in upstream_headers.items()}
+        self.assertEqual(header_map.get("mcp-method"), "tools/list")
+        self.assertEqual(header_map.get("mcp-name"), "tools/list")
+        self.assertEqual(header_map.get("mcp-protocol-version"), "2026-07-28")
+        # Client Plugin bearer must never appear on the upstream request.
+        self.assertFalse(
+            any(
+                v == f"Bearer {token['access_token']}"
+                for _, v in upstream_headers.items()
+            )
+        )
+
+    def test_tools_call_forwards_mcp_name_envelope_header(self) -> None:
+        # Under MCP 2026-07-28, Mcp-Name is material for name-bearing tools/call.
+        redirect = "https://chatgpt.com/connector/oauth/__test__"
+        client_id = self._register(redirect)
+        verifier, challenge = _pkce_pair()
+        token = self._authorize_and_token(
+            client_id=client_id,
+            redirect_uri=redirect,
+            verifier=verifier,
+            challenge=challenge,
+        )
+        tool_name = "read_file"
+        status, _, body = self._json(
+            "POST",
+            "/mcp",
+            body={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": {"path": "/tmp/x"}},
+            },
+            headers={
+                "Authorization": f"Bearer {token['access_token']}",
+                "MCP-Protocol-Version": "2026-07-28",
+                "Mcp-Method": "tools/call",
+                "Mcp-Name": tool_name,
+            },
+        )
+        self.assertEqual(status, 200)
+        assert isinstance(body, dict)
+        self.assertEqual(body["result"]["structuredContent"]["echo"]["name"], tool_name)
+        self.assertTrue(self.upstream.requests)
+        upstream_headers = self.upstream.requests[-1]["headers"]
+        upstream_auth = upstream_headers.get("Authorization")
+        self.assertEqual(upstream_auth, "Bearer upstream-secret-token")
+        self.assertNotEqual(upstream_auth, f"Bearer {token['access_token']}")
+        header_map = {k.lower(): v for k, v in upstream_headers.items()}
+        self.assertEqual(header_map.get("mcp-method"), "tools/call")
+        self.assertEqual(header_map.get("mcp-name"), tool_name)
+        self.assertEqual(header_map.get("mcp-protocol-version"), "2026-07-28")
+        self.assertFalse(
+            any(
+                v == f"Bearer {token['access_token']}"
+                for _, v in upstream_headers.items()
+            )
+        )
 
     def test_owner_approval_cannot_be_bypassed(self) -> None:
         redirect = "https://chatgpt.com/connector/oauth/__test__"

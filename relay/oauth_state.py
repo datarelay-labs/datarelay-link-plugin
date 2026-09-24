@@ -1,4 +1,9 @@
-"""Atomic durable OAuth client/refresh-token state for single-user relay.
+"""Atomic durable OAuth and tenant-binding state.
+
+Schema v1 is OAuth clients and refresh tokens only. Schema v2 adds
+``server_bindings`` (explicit Plugin subject → DRLink server connections).
+v1 files load as v2 with an empty binding map and are rewritten as v2 on the
+next save.
 
 Writes use a same-directory temp file, fsync the file contents, replace into
 place, then fsync the parent directory so the directory entry is durable across
@@ -10,10 +15,13 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-STATE_VERSION = 1
+STATE_VERSION = 2
+_LEGACY_VERSION = 1
 _FORBIDDEN_TOP_LEVEL = frozenset(
     {"owner_approval_secret", "upstream_token", "mock_plugin_token"}
 )
@@ -43,11 +51,35 @@ def _assert_safe_file_mode(path: Path) -> None:
         )
 
 
+def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a v2 payload. v1 migrates in memory; disk updates on the next save."""
+    version = payload.get("version")
+    if version not in {_LEGACY_VERSION, STATE_VERSION}:
+        raise OAuthStateError(
+            f"unsupported oauth state schema version: {version!r} "
+            f"(expected {STATE_VERSION})"
+        )
+    if _FORBIDDEN_TOP_LEVEL.intersection(payload.keys()):
+        raise OAuthStateError("oauth state contains forbidden credential fields")
+    clients_raw = payload.get("clients")
+    refresh_raw = payload.get("refresh_tokens")
+    if not isinstance(clients_raw, dict) or not isinstance(refresh_raw, dict):
+        raise OAuthStateError("oauth state missing clients/refresh_tokens maps")
+    bindings_raw = payload.get("server_bindings", {})
+    if not isinstance(bindings_raw, dict):
+        raise OAuthStateError("oauth state server_bindings must be an object")
+    normalized = dict(payload)
+    normalized["version"] = STATE_VERSION
+    normalized["server_bindings"] = bindings_raw
+    return normalized
+
+
 class DurableOAuthStore:
     """Versioned JSON state file with atomic replace and restrictive permissions."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self._io_lock = threading.RLock()
         if self.path.exists() and self.path.is_dir():
             raise OAuthStateError(
                 f"oauth state path must be a file, not a directory: {self.path}"
@@ -55,11 +87,28 @@ class DurableOAuthStore:
         _assert_safe_dir(self.path.parent)
 
     def load(self) -> dict[str, Any]:
+        with self._io_lock:
+            return self._load_unlocked()
+
+    def save(self, payload: dict[str, Any]) -> None:
+        with self._io_lock:
+            self._save_unlocked(payload)
+
+    def update(self, mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+        """Load, mutate, and save under one file lock so writers cannot drop keys."""
+        with self._io_lock:
+            payload = self._load_unlocked()
+            mutator(payload)
+            self._save_unlocked(payload)
+            return payload
+
+    def _load_unlocked(self) -> dict[str, Any]:
         if not self.path.exists():
             return {
                 "version": STATE_VERSION,
                 "clients": {},
                 "refresh_tokens": {},
+                "server_bindings": {},
             }
         _assert_safe_file_mode(self.path)
         try:
@@ -69,28 +118,16 @@ class DurableOAuthStore:
 
         if not isinstance(payload, dict):
             raise OAuthStateError("oauth state root must be an object")
-        version = payload.get("version")
-        if version != STATE_VERSION:
-            raise OAuthStateError(
-                f"unsupported oauth state schema version: {version!r} "
-                f"(expected {STATE_VERSION})"
-            )
-        if _FORBIDDEN_TOP_LEVEL.intersection(payload.keys()):
-            raise OAuthStateError("oauth state contains forbidden credential fields")
+        return _normalize_payload(payload)
 
-        clients_raw = payload.get("clients")
-        refresh_raw = payload.get("refresh_tokens")
-        if not isinstance(clients_raw, dict) or not isinstance(refresh_raw, dict):
-            raise OAuthStateError("oauth state missing clients/refresh_tokens maps")
-        return payload
-
-    def save(self, payload: dict[str, Any]) -> None:
+    def _save_unlocked(self, payload: dict[str, Any]) -> None:
         _assert_safe_dir(self.path.parent)
-        if payload.get("version") != STATE_VERSION:
+        if not isinstance(payload, dict):
+            raise OAuthStateError("oauth state root must be an object")
+        normalized = _normalize_payload(payload)
+        if normalized.get("version") != STATE_VERSION:
             raise OAuthStateError("refusing to persist unsupported oauth state version")
-        if _FORBIDDEN_TOP_LEVEL.intersection(payload.keys()):
-            raise OAuthStateError("refusing to persist forbidden credential fields")
-        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode(
+        encoded = json.dumps(normalized, separators=(",", ":"), sort_keys=True).encode(
             "utf-8"
         )
         fd: int | None = None

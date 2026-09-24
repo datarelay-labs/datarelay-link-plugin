@@ -19,7 +19,8 @@ _SENSITIVE_HEADER_NAMES = {
 _BEARER_RE = re.compile(r"(?i)(bearer\s+)\S+")
 _TOKEN_KV_RE = re.compile(
     r'(?i)("?(?:access_token|refresh_token|id_token|client_secret|api_key|authorization|'
-    r'code_verifier|code_challenge|owner_secret|owner_approval_secret|authorization_code)"?'
+    r'code_verifier|code_challenge|owner_secret|owner_approval_secret|authorization_code|'
+    r'upstream_token|upstream_bearer)"?'
     r'\s*[:=]\s*)("[^"]*"|\'[^\']*\'|\S+)'
 )
 

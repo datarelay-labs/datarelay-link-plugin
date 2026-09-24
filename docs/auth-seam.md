@@ -1,20 +1,18 @@
 # Auth design seam
 
-This module defines the **binding seam** between ChatGPT/Plugin identity and a
-single upstream DRLink MCP server.
+This module defines the **binding seam** between ChatGPT/Plugin identity and
+explicitly connected upstream DRLink MCP servers.
 
 ## Modes
 
 | Mode | Env | Intended use |
 | --- | --- | --- |
 | `mock` (default) | `DRLINK_RELAY_AUTH_MODE=mock` | Loopback / local tests with `DRLINK_RELAY_MOCK_PLUGIN_TOKEN` |
-| `oauth` | `DRLINK_RELAY_AUTH_MODE=oauth` | Single-user OAuth 2.1 PoC for ChatGPT Plus connection |
-
-Future multi-user / production identity service is out of scope.
+| `oauth` | `DRLINK_RELAY_AUTH_MODE=oauth` | OAuth 2.1 for ChatGPT Plus. Each approval mints a Plugin subject. |
 
 ## Responsibilities
 
-- Map an inbound Plugin / ChatGPT credential to exactly one upstream binding.
+- Map an inbound Plugin / ChatGPT credential to that subject's active connected DRLink server.
 - Supply upstream Authorization credentials without exposing DRLink private
   keys or long-lived server secrets to ChatGPT.
 - In OAuth mode: host protected-resource metadata, a built-in authorization
@@ -28,14 +26,25 @@ Future multi-user / production identity service is out of scope.
 - DRLink AI Access evaluation (owned by upstream DRLink Server).
 - Inventing or filtering tools.
 - Caching authorization decisions across tool calls.
-- Multi-tenant account brokerage or billing.
+- Account brokerage or billing. Subject bindings are connection state only.
 
 ## OAuth PoC constraints
 
 - Exactly one configured owner approval secret (`DRLINK_RELAY_OWNER_APPROVAL_SECRET`).
-- Exactly one configured upstream DRLink binding.
-- Durable OAuth state (`DRLINK_RELAY_OAUTH_STATE_PATH`) persists DCR clients and
-  refresh/revocation records across restarts; public/non-loopback OAuth requires it.
+- OAuth MCP calls do not use the process-global `DRLINK_RELAY_UPSTREAM_URL`.
+  A subject connects a server with `POST /bindings` (`upstream_url`, optional
+  `upstream_token`). The relay pins that server's addresses, stores the bearer
+  only in the durable state file, and never returns it. `GET /bindings` lists
+  id, host, connected, and active. `POST /bindings/{id}/activate` selects the
+  server used when `X-DRLink-Server-Binding` is absent.
+  `POST /bindings/{id}/disconnect` makes that server fail closed across restart.
+  A subject cannot resolve, activate, or disconnect another subject's binding.
+- `DRLINK_RELAY_UPSTREAM_URL` remains the mock-mode upstream and is still
+  required at process start. It is not an implicit OAuth route.
+- Durable state schema v2 (`DRLINK_RELAY_OAUTH_STATE_PATH`) persists DCR
+  clients, refresh/revocation records, and `server_bindings`. v1 files load as
+  v2 with an empty binding map and are rewritten on the next save.
+  Public/non-loopback OAuth requires the state file.
 - Loopback OAuth tests may set `DRLINK_RELAY_OAUTH_ALLOW_EPHEMERAL=1` instead of a
   state file; ephemeral mode is not allowed for public listeners.
 - Access tokens and authorization codes remain short-lived/ephemeral; reconnect

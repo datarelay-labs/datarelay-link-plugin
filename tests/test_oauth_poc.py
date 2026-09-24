@@ -60,10 +60,13 @@ class OAuthRelayTestCase(unittest.TestCase):
             "DRLINK_RELAY_AUTH_MODE": "oauth",
             "DRLINK_RELAY_PUBLIC_BASE_URL": self.public_base,
             "DRLINK_RELAY_OWNER_APPROVAL_SECRET": self.owner_secret,
-            "DRLINK_RELAY_OAUTH_ALLOW_EPHEMERAL": "1",
-            # Intentionally set mock token; oauth mode must ignore it.
-            "DRLINK_RELAY_MOCK_PLUGIN_TOKEN": "dev-plugin-token",
         }
+        if getattr(self, "state_path", None):
+            env["DRLINK_RELAY_OAUTH_STATE_PATH"] = self.state_path
+        else:
+            env["DRLINK_RELAY_OAUTH_ALLOW_EPHEMERAL"] = "1"
+        # Intentionally set mock token; oauth mode must ignore it.
+        env["DRLINK_RELAY_MOCK_PLUGIN_TOKEN"] = "dev-plugin-token"
         self.config = load_config(env)
         self.server = create_server(self.config, self.logger)
         self.relay_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -216,6 +219,22 @@ class OAuthRelayTestCase(unittest.TestCase):
         assert isinstance(token, dict)
         return token
 
+    def _connect_upstream(self, access_token: str) -> dict[str, Any]:
+        status, _, body = self._json(
+            "POST",
+            "/bindings",
+            body={
+                "upstream_url": self.config.upstream_url,
+                "upstream_token": "upstream-secret-token",
+            },
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(status, 201, body)
+        assert isinstance(body, dict)
+        self.assertNotIn("upstream_bearer", json.dumps(body))
+        self.assertNotIn("upstream-secret-token", json.dumps(body))
+        return body
+
     def test_protected_resource_metadata(self) -> None:
         status, _, body = self._json("GET", "/.well-known/oauth-protected-resource")
         self.assertEqual(status, 200)
@@ -335,6 +354,7 @@ class OAuthRelayTestCase(unittest.TestCase):
             resource=self.resource,
             scopes=frozenset({DEFAULT_SCOPE}),
             expires_at=time.time() + 60,
+            subject="tn_replay",
         )
         form = {
             "grant_type": "authorization_code",
@@ -368,6 +388,7 @@ class OAuthRelayTestCase(unittest.TestCase):
             resource=self.resource,
             scopes=frozenset({DEFAULT_SCOPE}),
             expires_at=time.time() - 1,
+            subject="tn_expired",
         )
         status, _, body = self._json(
             "POST",
@@ -621,6 +642,7 @@ class OAuthRelayTestCase(unittest.TestCase):
             verifier=verifier,
             challenge=challenge,
         )
+        self._connect_upstream(token["access_token"])
         status, _, body = self._json(
             "POST",
             "/mcp",
@@ -645,6 +667,7 @@ class OAuthRelayTestCase(unittest.TestCase):
             verifier=verifier,
             challenge=challenge,
         )
+        self._connect_upstream(token["access_token"])
         self._json(
             "POST",
             "/mcp",
@@ -685,6 +708,7 @@ class OAuthRelayTestCase(unittest.TestCase):
             verifier=verifier,
             challenge=challenge,
         )
+        self._connect_upstream(token["access_token"])
         tool_name = "read_file"
         status, _, body = self._json(
             "POST",

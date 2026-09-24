@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .config import AUTH_MODE_MOCK, AUTH_MODE_OAUTH, RelayConfig
 from .oauth import OAuthError, OAuthService
+
+if TYPE_CHECKING:
+    from .tenant_bindings import TenantBindingRegistry
 
 
 class BindingError(PermissionError):
@@ -18,11 +22,13 @@ class BindingError(PermissionError):
         status: int = 401,
         oauth_error: str | None = None,
         oauth_description: str | None = None,
+        subject: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.oauth_error = oauth_error
         self.oauth_description = oauth_description
+        self.subject = subject
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,7 @@ class UpstreamBinding:
     allow_loopback_upstream: bool
     upstream_authorization: str | None
     plugin_subject: str
+    tenant_id: str = ""
 
 
 def _upstream_binding(config: RelayConfig, *, binding_id: str, subject: str) -> UpstreamBinding:
@@ -46,6 +53,7 @@ def _upstream_binding(config: RelayConfig, *, binding_id: str, subject: str) -> 
         allow_loopback_upstream=config.allow_loopback_upstream,
         upstream_authorization=upstream_auth,
         plugin_subject=subject,
+        tenant_id=subject,
     )
 
 
@@ -84,15 +92,23 @@ class MockBindingStore:
 
 
 class BindingResolver:
-    """Resolve inbound ChatGPT/Plugin credentials to the single upstream binding.
+    """Resolve inbound ChatGPT/Plugin credentials to an explicit upstream binding.
 
-    OAuth mode never falls back to the mock plugin token.
+    Mock mode keeps the single configured local upstream. OAuth mode resolves
+    only a server that the token subject explicitly connected. OAuth mode never
+    falls back to the mock plugin token or to a process-global upstream URL.
     """
 
-    def __init__(self, config: RelayConfig, oauth: OAuthService | None = None) -> None:
+    def __init__(
+        self,
+        config: RelayConfig,
+        oauth: OAuthService | None = None,
+        tenants: TenantBindingRegistry | None = None,
+    ) -> None:
         self._config = config
         self._mock = MockBindingStore(config)
         self._oauth = oauth
+        self._tenants = tenants
 
     @property
     def mock(self) -> MockBindingStore:
@@ -102,27 +118,47 @@ class BindingResolver:
     def oauth(self) -> OAuthService | None:
         return self._oauth
 
-    def resolve(self, authorization_header: str | None) -> UpstreamBinding:
+    @property
+    def tenants(self) -> TenantBindingRegistry | None:
+        return self._tenants
+
+    def require_subject(self, authorization_header: str | None) -> str:
+        """Authenticate the Plugin caller without selecting an upstream."""
+        if self._config.auth_mode != AUTH_MODE_OAUTH:
+            raise BindingError("oauth not configured", status=404)
+        token = self._validate_oauth(authorization_header)
+        return token.subject
+
+    def resolve(
+        self,
+        authorization_header: str | None,
+        *,
+        binding_selector: str | None = None,
+    ) -> UpstreamBinding:
         if self._config.auth_mode == AUTH_MODE_OAUTH:
-            if self._oauth is None:
+            token = self._validate_oauth(authorization_header)
+            if self._tenants is None:
                 raise BindingError("oauth not configured")
-            # Never accept mock bearer tokens in production OAuth mode.
-            try:
-                token = self._oauth.validate_bearer(authorization_header)
-            except OAuthError as exc:
-                raise BindingError(
-                    str(exc),
-                    status=exc.status,
-                    oauth_error=exc.error,
-                    oauth_description=exc.description,
-                ) from exc
-            return _upstream_binding(
-                self._config,
-                binding_id="oauth-binding-1",
-                subject=token.subject,
+            # Connection state only. Upstream DRLink still authorizes the call.
+            return self._tenants.resolve(
+                subject=token.subject, binding_id=binding_selector
             )
 
         if self._config.auth_mode == AUTH_MODE_MOCK:
             return self._mock.resolve(authorization_header)
 
         raise BindingError("unsupported auth mode")
+
+    def _validate_oauth(self, authorization_header: str | None):
+        if self._oauth is None:
+            raise BindingError("oauth not configured")
+        # Never accept mock bearer tokens in production OAuth mode.
+        try:
+            return self._oauth.validate_bearer(authorization_header)
+        except OAuthError as exc:
+            raise BindingError(
+                str(exc),
+                status=exc.status,
+                oauth_error=exc.error,
+                oauth_description=exc.description,
+            ) from exc

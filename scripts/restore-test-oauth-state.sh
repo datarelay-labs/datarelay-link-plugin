@@ -41,11 +41,27 @@ with tempfile.TemporaryDirectory() as tmp:
                 "subject": "relay-owner",
             }
         },
+        "server_bindings": {
+            "bnd_restore": {
+                "binding_id": "bnd_restore",
+                "subject": "relay-owner",
+                "upstream_url": "http://127.0.0.1:9/mcp",
+                "upstream_host": "127.0.0.1",
+                "connect_ips": ["127.0.0.1"],
+                "allow_loopback": True,
+                "upstream_bearer": "restore-bearer",
+                "connected": True,
+                "active": True,
+                "created_at": now,
+            }
+        },
     }
     store.save(payload)
     loaded = DurableOAuthStore(path).load()
     assert loaded["clients"]["client_restore"]["client_id"] == "client_restore"
     assert loaded["refresh_tokens"]["rtk_restore"]["token"] == "rtk_restore"
+    assert loaded["server_bindings"]["bnd_restore"]["binding_id"] == "bnd_restore"
+    assert loaded["server_bindings"]["bnd_restore"]["upstream_bearer"] == "restore-bearer"
     mode = path.stat().st_mode & 0o777
     assert mode == 0o600, mode
 print("oauth state restore-test PASS")

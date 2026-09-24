@@ -1,6 +1,6 @@
 # datarelay-link-plugin
 
-ChatGPT Plus / Codex **Agent Plugins** package and single-user MCP relay PoC for [DataRelay Link](https://github.com/datarelay-labs/datarelay-link).
+ChatGPT Plus / Codex **Agent Plugins** package and MCP relay for [DataRelay Link](https://github.com/datarelay-labs/datarelay-link).
 
 > **License — Source Available:** licensed under the **Data Relay Source Available License 1.0** (not Apache-2.0 / not OSI open source). See [LICENSE](LICENSE) and [LICENSING.md](LICENSING.md).
 
@@ -26,7 +26,7 @@ See [docs/architecture.md](docs/architecture.md) and [docs/openai-plugin-assumpt
 | Path | Purpose |
 | --- | --- |
 | `plugin.json` / `mcp.json` | Portable Agent Plugins package (Remote MCP-only) |
-| `relay/` | Single-user Streamable HTTP MCP relay PoC |
+| `relay/` | Streamable HTTP MCP relay. Mock mode is single-upstream; OAuth mode binds each Plugin subject to explicitly connected DRLink servers. |
 | `schemas/` | Vendored Agent Plugins JSON Schemas for local validation |
 | `docs/` | Architecture, auth seam, verified OpenAI assumptions |
 | `.engineering/` | DataRelay Engineering System adoption |
@@ -79,7 +79,18 @@ Discovery:
 - `GET /.well-known/oauth-protected-resource`
 - `GET /.well-known/oauth-authorization-server`
 
-Owner consent uses the runtime approval secret (never commit it). Public HTTPS
+Owner consent uses the runtime approval secret (never commit it). After the
+Plugin subject has an access token, connect that subject's DRLink server:
+
+```bash
+curl -sS -X POST "$DRLINK_RELAY_PUBLIC_BASE_URL/bindings" \
+  -H "Authorization: Bearer $PLUGIN_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"upstream_url":"https://customer-drlink.example/mcp","upstream_token":"replace-me"}'
+```
+
+OAuth `/mcp` calls use that connected server. The process-global
+`DRLINK_RELAY_UPSTREAM_URL` is the mock-mode upstream only. Public HTTPS
 deployment URLs remain configurable; this repo does not claim public Plugin
 availability.
 

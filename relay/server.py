@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -14,6 +15,10 @@ from .binding import BindingError, BindingResolver
 from .config import AUTH_MODE_OAUTH, RelayConfig
 from .oauth import OAuthError, OAuthService, PendingAuthorization
 from .proxy import UpstreamUnavailable, proxy_mcp_request
+from .tenant_bindings import TenantBindingRegistry
+
+_BINDING_ID_RE = re.compile(r"^bnd_[A-Za-z0-9_-]{8,128}$")
+_BINDING_BODY_LIMIT = 8192
 
 
 class RelayHTTPServer(ThreadingHTTPServer):
@@ -127,6 +132,9 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         if path == "/mcp":
             self._handle_mcp("GET")
             return
+        if path == "/bindings":
+            self._handle_bindings_list()
+            return
         self._send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -145,6 +153,14 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/mcp":
             self._handle_mcp("POST")
+            return
+        if path == "/bindings":
+            self._handle_bindings_connect()
+            return
+        action = _binding_action(path)
+        if action is not None:
+            binding_id, name = action
+            self._handle_binding_action(binding_id, name)
             return
         self._send_json(404, {"error": "not_found"})
 
@@ -380,6 +396,163 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             },
         }
 
+    def _authenticated_subject(self) -> str:
+        try:
+            return self.server.bindings.require_subject(self.headers.get("Authorization"))
+        except BindingError as exc:
+            self._send_binding_denied(exc, body=b"")
+            return ""
+
+    def _send_binding_denied(self, exc: BindingError, *, body: bytes) -> None:
+        config = self.server.relay_config
+        logger = self.server.audit_logger
+        audit_event(
+            logger,
+            "binding_access_denied",
+            reason=str(exc),
+            plugin_subject=exc.subject or "",
+            tenant_id=exc.subject or "",
+        )
+        extra: list[tuple[str, str]] = []
+        oauth = self._oauth()
+        if config.auth_mode == AUTH_MODE_OAUTH and oauth is not None:
+            error = exc.oauth_error or (
+                "insufficient_scope" if exc.status == 403 else "invalid_token"
+            )
+            description = exc.oauth_description or str(exc)
+            extra.append(
+                (
+                    "WWW-Authenticate",
+                    oauth.www_authenticate(error=error, error_description=description),
+                )
+            )
+        self._send_json(
+            exc.status,
+            {"error": "unauthorized", "message": str(exc)},
+            extra_headers=extra,
+        )
+
+    def _require_tenants(self) -> TenantBindingRegistry | None:
+        tenants = self.server.bindings.tenants
+        if tenants is None:
+            self._send_json(404, {"error": "not_found"})
+        return tenants
+
+    def _handle_bindings_list(self) -> None:
+        tenants = self._require_tenants()
+        if tenants is None:
+            return
+        subject = self._authenticated_subject()
+        if not subject:
+            return
+        self._send_json(200, {"bindings": tenants.list_bindings(subject)})
+
+    def _handle_bindings_connect(self) -> None:
+        logger = self.server.audit_logger
+        tenants = self._require_tenants()
+        if tenants is None:
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self._send_json(400, {"error": "invalid_body"})
+            return
+        if length < 0 or length > _BINDING_BODY_LIMIT:
+            self._send_json(400, {"error": "invalid_body"})
+            return
+        try:
+            raw = self.rfile.read(length) if length else b""
+        except ValueError:
+            self._send_json(400, {"error": "invalid_body"})
+            return
+        subject = self._authenticated_subject()
+        if not subject:
+            return
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeError, json.JSONDecodeError, ValueError):
+            self._send_json(400, {"error": "invalid_body"})
+            return
+        if not isinstance(payload, dict):
+            self._send_json(400, {"error": "invalid_body"})
+            return
+        allowed = {"upstream_url", "upstream_token"}
+        if not set(payload).issubset(allowed) or "upstream_url" not in payload:
+            self._send_json(400, {"error": "invalid_body"})
+            return
+        token = payload.get("upstream_token")
+        if token is not None and not isinstance(token, str):
+            self._send_json(400, {"error": "invalid_body"})
+            return
+        url = payload.get("upstream_url")
+        if not isinstance(url, str):
+            self._send_json(400, {"error": "invalid_body"})
+            return
+        try:
+            view = tenants.connect(
+                subject=subject,
+                upstream_url=url,
+                upstream_token=token,
+            )
+        except BindingError as exc:
+            audit_event(
+                logger,
+                "binding_connect_denied",
+                reason=str(exc),
+                plugin_subject=subject,
+                tenant_id=subject,
+            )
+            self._send_json(exc.status, {"error": "invalid_upstream", "message": str(exc)})
+            return
+        audit_event(
+            logger,
+            "binding_connected",
+            plugin_subject=subject,
+            tenant_id=subject,
+            binding_id=view["binding_id"],
+            upstream_host=view["upstream_host"],
+        )
+        self._send_json(201, view)
+
+    def _handle_binding_action(self, binding_id: str, action: str) -> None:
+        logger = self.server.audit_logger
+        tenants = self._require_tenants()
+        if tenants is None:
+            return
+        subject = self._authenticated_subject()
+        if not subject:
+            return
+        try:
+            if action == "disconnect":
+                view = tenants.disconnect(subject=subject, binding_id=binding_id)
+                event = "binding_disconnected"
+            else:
+                view = tenants.activate(subject=subject, binding_id=binding_id)
+                event = "binding_activated"
+        except BindingError as exc:
+            audit_event(
+                logger,
+                "binding_action_denied",
+                reason=str(exc),
+                plugin_subject=subject,
+                tenant_id=subject,
+                binding_id=binding_id,
+            )
+            self._send_json(
+                exc.status,
+                {"error": "binding_unavailable", "message": str(exc)},
+            )
+            return
+        audit_event(
+            logger,
+            event,
+            plugin_subject=subject,
+            tenant_id=subject,
+            binding_id=binding_id,
+            upstream_host=view["upstream_host"],
+        )
+        self._send_json(200, view)
+
     def _handle_mcp(self, method: str) -> None:
         config = self.server.relay_config
         logger = self.server.audit_logger
@@ -389,14 +562,20 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid_body"})
             return
 
+        selector = (self.headers.get("X-DRLink-Server-Binding") or "").strip() or None
         try:
-            binding = self.server.bindings.resolve(self.headers.get("Authorization"))
+            binding = self.server.bindings.resolve(
+                self.headers.get("Authorization"),
+                binding_selector=selector,
+            )
         except BindingError as exc:
             audit_event(
                 logger,
                 "mcp_binding_denied",
                 reason=str(exc),
                 method=method,
+                plugin_subject=exc.subject or "",
+                tenant_id=exc.subject or "",
             )
             extra: list[tuple[str, str]] = []
             oauth = self._oauth()
@@ -450,10 +629,29 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         self._send_bytes(proxied.status, proxied.body, proxied.headers)
 
 
+def _binding_action(path: str) -> tuple[str, str] | None:
+    parts = path.split("/")
+    if len(parts) != 4 or parts[1] != "bindings":
+        return None
+    if parts[3] not in {"disconnect", "activate"}:
+        return None
+    if not _BINDING_ID_RE.fullmatch(parts[2]):
+        return None
+    return parts[2], parts[3]
+
+
 def create_server(config: RelayConfig, logger: logging.Logger | None = None) -> RelayHTTPServer:
     log = logger or configure_logging()
     oauth = OAuthService(config) if config.auth_mode == AUTH_MODE_OAUTH else None
-    bindings = BindingResolver(config, oauth)
+    tenants = None
+    if oauth is not None:
+        tenants = TenantBindingRegistry(
+            allow_loopback=config.allow_loopback_upstream,
+            public_base_url=config.public_base_url,
+            store=oauth.store,
+        )
+        oauth.attach_binding_snapshot(tenants.snapshot)
+    bindings = BindingResolver(config, oauth, tenants)
     return RelayHTTPServer(
         (config.bind_host, config.bind_port),
         config,

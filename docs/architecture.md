@@ -14,14 +14,15 @@ ChatGPT Plus
 | Layer | Owns | Does not own |
 | --- | --- | --- |
 | Plugin package | Install identity, remote MCP declaration | Authorization, host access |
-| Relay (this repo) | Transport, single-user binding seam, audit | Tool invention, authz decisions |
+| Relay (this repo) | Transport, per-subject DRLink server bindings, audit | Tool invention, authz decisions |
 | DRLink Server (`datarelay-labs/datarelay-link`) | Final per-call AI Access | ChatGPT packaging |
 
 This repository must not modify `datarelay-labs/datarelay-link`. Core MCP interoperability (initialize, annotations, OAuth securitySchemes, challenge metadata) continues in that repo (tracked separately, e.g. issue #47). The relay treats upstream as an opaque Streamable HTTP MCP peer.
 
 ## Packet 1 relay contract
 
-- Exactly one configured upstream DRLink MCP URL.
+- Mock mode uses exactly one configured upstream DRLink MCP URL.
+- OAuth mode routes each Plugin subject only to DRLink servers that subject explicitly connected.
 - Pass-through of `initialize`, `tools/list`, `tools/call`, and JSON-RPC errors.
 - Preserve JSON-RPC `id` / result / error payloads.
 - Preserve/forward MCP protocol headers (`Mcp-Session-Id`, `Last-Event-ID`, `Accept`, `Content-Type`).

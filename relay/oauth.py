@@ -17,6 +17,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
 
@@ -116,6 +117,7 @@ class AuthCode:
     resource: str
     scopes: frozenset[str]
     expires_at: float
+    subject: str
     used: bool = False
 
 
@@ -219,6 +221,9 @@ class OAuthService:
     pending: dict[str, PendingAuthorization] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock)
     _store: DurableOAuthStore | None = field(default=None, init=False, repr=False)
+    _binding_snapshot: Callable[[], dict[str, Any]] | None = field(
+        default=None, init=False, repr=False
+    )
     _dcr_limiter: _SlidingWindow = field(
         default_factory=lambda: _SlidingWindow(DCR_RATE_LIMIT, DCR_RATE_WINDOW_S),
         init=False,
@@ -234,6 +239,14 @@ class OAuthService:
         init=False,
         repr=False,
     )
+
+    @property
+    def store(self) -> DurableOAuthStore | None:
+        return self._store
+
+    def attach_binding_snapshot(self, snapshot: Callable[[], dict[str, Any]]) -> None:
+        """Preserve tenant server bindings when OAuth state is rewritten."""
+        self._binding_snapshot = snapshot
 
     def __post_init__(self) -> None:
         if self.config.oauth_state_path:
@@ -309,36 +322,43 @@ class OAuthService:
         ]
         for tid in expired:
             del self.refresh_tokens[tid]
-        payload = {
-            "version": STATE_VERSION,
-            "clients": {
-                cid: {
-                    "client_id": c.client_id,
-                    "redirect_uris": list(c.redirect_uris),
-                    "client_name": c.client_name,
-                    "token_endpoint_auth_method": c.token_endpoint_auth_method,
-                    "grant_types": list(c.grant_types),
-                    "response_types": list(c.response_types),
-                    "issued_at": c.issued_at,
-                    "last_used_at": c.last_used_at,
-                }
-                for cid, c in self.clients.items()
-            },
-            "refresh_tokens": {
-                tid: {
-                    "token": t.token,
-                    "client_id": t.client_id,
-                    "resource": t.resource,
-                    "scopes": sorted(t.scopes),
-                    "expires_at": t.expires_at,
-                    "revoked": t.revoked,
-                    "subject": t.subject,
-                }
-                for tid, t in self.refresh_tokens.items()
-            },
+        clients = {
+            cid: {
+                "client_id": c.client_id,
+                "redirect_uris": list(c.redirect_uris),
+                "client_name": c.client_name,
+                "token_endpoint_auth_method": c.token_endpoint_auth_method,
+                "grant_types": list(c.grant_types),
+                "response_types": list(c.response_types),
+                "issued_at": c.issued_at,
+                "last_used_at": c.last_used_at,
+            }
+            for cid, c in self.clients.items()
         }
+        refresh_tokens = {
+            tid: {
+                "token": t.token,
+                "client_id": t.client_id,
+                "resource": t.resource,
+                "scopes": sorted(t.scopes),
+                "expires_at": t.expires_at,
+                "revoked": t.revoked,
+                "subject": t.subject,
+            }
+            for tid, t in self.refresh_tokens.items()
+        }
+
+        def _mutate(payload: dict[str, Any]) -> None:
+            payload["version"] = STATE_VERSION
+            payload["clients"] = clients
+            payload["refresh_tokens"] = refresh_tokens
+            # Read bindings inside the file lock so a concurrent connect cannot
+            # be overwritten by a stale snapshot captured earlier.
+            if self._binding_snapshot is not None:
+                payload["server_bindings"] = self._binding_snapshot()
+
         try:
-            self._store.save(payload)
+            self._store.update(_mutate)
         except OAuthStateError as exc:
             raise OAuthError("server_error", str(exc), status=500) from exc
 
@@ -767,6 +787,9 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
                 client.last_used_at = time.time()
 
         code_value = _new_token("code")
+        # Each approval is a distinct Plugin subject. Refresh keeps this subject.
+        # This is identity for binding ownership, not a second authorization system.
+        subject = "tn_" + secrets.token_urlsafe(18)
         auth_code = AuthCode(
             code=code_value,
             client_id=pending.client_id,
@@ -776,6 +799,7 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
             resource=pending.resource,
             scopes=pending.scopes,
             expires_at=time.time() + CODE_TTL_S,
+            subject=subject,
         )
         with self._lock:
             self.codes[code_value] = auth_code
@@ -826,6 +850,7 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
                 client_id=client_id,
                 resource=record.resource,
                 scopes=record.scopes,
+                subject=record.subject,
             )
 
     def _exchange_refresh_token(self, form: dict[str, str]) -> dict[str, Any]:
@@ -859,10 +884,16 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
                 client_id=client_id,
                 resource=record.resource,
                 scopes=scopes,
+                subject=record.subject,
             )
 
     def _issue_tokens(
-        self, *, client_id: str, resource: str, scopes: frozenset[str]
+        self,
+        *,
+        client_id: str,
+        resource: str,
+        scopes: frozenset[str],
+        subject: str = "relay-owner",
     ) -> dict[str, Any]:
         now = time.time()
         access = AccessToken(
@@ -871,6 +902,7 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
             resource=resource,
             scopes=scopes,
             expires_at=now + ACCESS_TTL_S,
+            subject=subject,
         )
         refresh = RefreshToken(
             token=_new_token("rtk"),
@@ -878,6 +910,7 @@ input[type=password]{{width:100%;padding:.5rem}} button{{margin-top:1rem;padding
             resource=resource,
             scopes=scopes,
             expires_at=now + REFRESH_TTL_S,
+            subject=subject,
         )
         self.access_tokens[access.token] = access
         self.refresh_tokens[refresh.token] = refresh

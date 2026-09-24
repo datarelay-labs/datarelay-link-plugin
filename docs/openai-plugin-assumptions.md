@@ -3,6 +3,7 @@
 Sources consulted (official only):
 
 - [Package your plugin](https://developers.openai.com/plugins/build/plugins) (OpenAI Developers)
+- [Plugin submission errors](https://developers.openai.com/plugins/deploy/submission-errors) (OpenAI Developers)
 - [Build an MCP server](https://developers.openai.com/plugins/build/mcp-server) (OpenAI Developers)
 - [Authentication (Apps SDK / Plugins)](https://developers.openai.com/apps-sdk/build/auth) (OpenAI Developers)
 - [Apps SDK quickstart](https://developers.openai.com/apps-sdk/quickstart) (OpenAI Developers)
@@ -30,6 +31,9 @@ Repository contract for this phase:
 5. A production URL is an input to `scripts/submission-readiness.py`. Missing owner input is BLOCKED. An explicitly supplied URL is FAIL when it is not HTTPS, not exactly `/mcp`, has a query or fragment, embeds credentials, or uses a loopback, private, link-local, metadata, or reserved literal address. The checker does not probe DNS. Hostname reachability stays BLOCKED.
 6. `package_layout` and `mcp_package_wiring` PASS when that portable contract holds. `repository_checks_ok` can be true while `submission_ready` stays false and `overall_status` stays BLOCKED, because owner and platform prerequisites remain BLOCKED.
 7. This repository does not create DNS, activate a live challenge token, or submit the plugin. It ships no skills and no custom UI.
+8. Remote MCP final submission requires a demo-recording URL. `demo_recording_url` stays BLOCKED. This repository does not invent a URL or a recording.
+9. Reviewer fixtures are exactly five positive cases and three negative cases. Six positive or four negative cases fail the readiness check.
+10. `tool_metadata_passthrough` PASS means `RelayTestCase.test_tools_metadata_passthrough_is_unmodified` passed. The checker does not scan source text for annotation names.
 
 ## MCP wire behavior
 

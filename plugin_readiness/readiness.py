@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -100,9 +103,9 @@ def _review_cases_ok(cases: Any) -> bool:
         return False
     positive = cases.get("positive")
     negative = cases.get("negative")
-    if not isinstance(positive, list) or len(positive) < 5:
+    if not isinstance(positive, list) or len(positive) != 5:
         return False
-    if not isinstance(negative, list) or len(negative) < 3:
+    if not isinstance(negative, list) or len(negative) != 3:
         return False
     for case in positive:
         if not isinstance(case, dict) or not all(_nonempty(case.get(field)) for field in _POSITIVE_FIELDS):
@@ -115,6 +118,41 @@ def _review_cases_ok(cases: Any) -> bool:
         if not all(_nonempty(case.get(field)) for field in _NEGATIVE_FIELDS):
             return False
     return True
+
+
+def metadata_passthrough_evidence(root: Path) -> tuple[bool, str]:
+    """Run the relay metadata passthrough test and return its result.
+
+    This is the behavioral evidence for ``tool_metadata_passthrough``. It does
+    not search source text for annotation token names.
+    """
+    env = os.environ.copy()
+    root_s = str(root)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = root_s if not existing else root_s + os.pathsep + existing
+    command = [
+        sys.executable,
+        "-m",
+        "unittest",
+        "tests.test_relay_poc.RelayTestCase.test_tools_metadata_passthrough_is_unmodified",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "behavioral metadata passthrough test did not finish"
+    if completed.returncode == 0:
+        return True, (
+            "behavioral test RelayTestCase.test_tools_metadata_passthrough_is_unmodified passed"
+        )
+    return False, "behavioral metadata passthrough test failed"
 
 
 def validate_mcp_url(url: str, *, allow_loopback: bool) -> str:
@@ -277,7 +315,6 @@ def evaluate(root: Path | None = None, *, mode: str, mcp_url: str | None = None)
     portable_mcp = base / "mcp.json"
     cases_path = base / "docs" / "submission" / "review-cases.json"
     server_py = base / "relay" / "server.py"
-    metadata_test = base / "tests" / "test_relay_poc.py"
     prompts: list[Any] | None = None
     dev_loopback = False
 
@@ -442,26 +479,12 @@ def evaluate(root: Path | None = None, *, mode: str, mcp_url: str | None = None)
         )
     )
 
-    try:
-        test_source = metadata_test.read_text(encoding="utf-8")
-        metadata_ok = all(
-            token in test_source
-            for token in (
-                "readOnlyHint",
-                "openWorldHint",
-                "destructiveHint",
-                "securitySchemes",
-                "mcp/www_authenticate",
-                "outputSchema",
-            )
-        )
-    except OSError:
-        metadata_ok = False
+    metadata_ok, metadata_reason = metadata_passthrough_evidence(base)
     items.append(
         _item(
             "tool_metadata_passthrough",
             _status(metadata_ok),
-            "unit coverage preserves upstream tool metadata and annotations",
+            metadata_reason,
             "repository",
         )
     )
@@ -474,7 +497,7 @@ def evaluate(root: Path | None = None, *, mode: str, mcp_url: str | None = None)
         _item(
             "reviewer_test_cases",
             _status(cases_ok),
-            "fixtures include 5 positive and 3 negative cases with the OpenAI review fields",
+            "fixtures are exactly 5 positive and 3 negative cases with the OpenAI review fields",
             "repository",
         )
     )
@@ -496,6 +519,10 @@ def evaluate(root: Path | None = None, *, mode: str, mcp_url: str | None = None)
             _blocked(
                 "reviewer_credentials",
                 "owner has not provisioned reviewer credentials that work without MFA, SMS, email confirmation, or private-network access",
+            ),
+            _blocked(
+                "demo_recording_url",
+                "owner has not approved a public demo-recording URL; none is invented in this repository",
             ),
             _blocked(
                 "apps_management_permission",

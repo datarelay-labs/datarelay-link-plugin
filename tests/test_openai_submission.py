@@ -12,6 +12,7 @@ from urllib import error, request
 
 from plugin_readiness.readiness import (
     PackageError,
+    _review_cases_ok,
     evaluate,
     render_mcp_document,
     resolve_canonical_interface,
@@ -184,6 +185,11 @@ class PackageContractTests(unittest.TestCase):
         self.assertEqual(by_id["oauth_discovery"], "PASS")
         self.assertEqual(by_id["domain_challenge_code"], "PASS")
         self.assertEqual(by_id["tool_metadata_passthrough"], "PASS")
+        metadata_reason = next(
+            item["reason"] for item in report["items"] if item["id"] == "tool_metadata_passthrough"
+        )
+        self.assertIn("test_tools_metadata_passthrough_is_unmodified", metadata_reason)
+        self.assertNotIn("token", metadata_reason.lower())
         self.assertEqual(by_id["reviewer_test_cases"], "PASS")
         self.assertEqual(by_id["starter_prompts"], "PASS")
         for blocked in (
@@ -192,6 +198,7 @@ class PackageContractTests(unittest.TestCase):
             "domain_challenge_live",
             "website_support_privacy_terms",
             "reviewer_credentials",
+            "demo_recording_url",
             "apps_management_permission",
             "listing_logo_assets",
             "openai_project_data_residency",
@@ -231,6 +238,7 @@ class PackageContractTests(unittest.TestCase):
         supplied_ids = {item["id"]: item["status"] for item in supplied["items"]}
         self.assertEqual(supplied_ids["production_mcp_url"], "PASS")
         self.assertEqual(supplied_ids["reviewer_credentials"], "BLOCKED")
+        self.assertEqual(supplied_ids["demo_recording_url"], "BLOCKED")
         self.assertEqual(supplied_ids["country_availability"], "BLOCKED")
         self.assertEqual(supplied_ids["publisher_identity"], "BLOCKED")
         self.assertEqual(supplied_ids["mcp_package_wiring"], "PASS")
@@ -248,8 +256,19 @@ class PackageContractTests(unittest.TestCase):
         cases = json.loads(
             (ROOT / "docs" / "submission" / "review-cases.json").read_text(encoding="utf-8")
         )
-        self.assertGreaterEqual(len(cases["positive"]), 5)
-        self.assertGreaterEqual(len(cases["negative"]), 3)
+        self.assertEqual(len(cases["positive"]), 5)
+        self.assertEqual(len(cases["negative"]), 3)
+        self.assertTrue(_review_cases_ok(cases))
+        six_positive = json.loads(json.dumps(cases))
+        six_positive["positive"].append(dict(cases["positive"][0]))
+        self.assertEqual(len(six_positive["positive"]), 6)
+        self.assertEqual(len(six_positive["negative"]), 3)
+        self.assertFalse(_review_cases_ok(six_positive))
+        five_four = json.loads(json.dumps(cases))
+        five_four["negative"].append(dict(cases["negative"][0]))
+        self.assertEqual(len(five_four["positive"]), 5)
+        self.assertEqual(len(five_four["negative"]), 4)
+        self.assertFalse(_review_cases_ok(five_four))
         self.assertIn("AI Access", cases["authority"])
         for case in cases["positive"]:
             for field in (

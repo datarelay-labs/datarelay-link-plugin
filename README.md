@@ -28,7 +28,7 @@ See [docs/architecture.md](docs/architecture.md) and [docs/openai-plugin-assumpt
 | `plugin.json` | Canonical portable Agent Plugins manifest. OpenAI settings are under `extensions.com.openai` |
 | `.codex-plugin/plugin.json` | Compatibility fallback. OpenAI ignores it when the root extension object is present |
 | `mcp.json` | Portable MCP configuration (`streamable-http`). The committed URL is the local PoC |
-| `docs/submission/review-cases.json` | 5 positive and 3 negative reviewer fixtures |
+| `docs/submission/review-cases.json` | Exactly 5 positive and 3 negative reviewer fixtures |
 | `relay/` | Streamable HTTP MCP relay. Mock mode is single-upstream; OAuth mode binds each Plugin subject to explicitly connected DRLink servers. |
 | `schemas/` | Vendored Agent Plugins JSON Schemas for local validation |
 | `docs/` | Architecture, auth seam, verified OpenAI assumptions |

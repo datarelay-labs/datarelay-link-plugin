@@ -367,7 +367,7 @@ class PackageContractTests(unittest.TestCase):
         empty["tools"] = []
         empty_report = evaluate(mode="submission", mcp_url=url, tool_scan_evidence=empty)
         empty_ids = {item["id"]: item["status"] for item in empty_report["items"]}
-        self.assertEqual(empty_ids["scan_required"], "PASS")
+        self.assertEqual(empty_ids["scan_required"], "FAIL")
         self.assertEqual(empty_ids["annotations_required"], "FAIL")
         self.assertEqual(empty_ids["justification_required"], "FAIL")
         self.assertFalse(empty_report["submission_ready"])

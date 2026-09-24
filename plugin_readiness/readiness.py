@@ -162,9 +162,10 @@ def production_tool_scan_items(mcp_url: str | None, evidence: Any) -> list[dict[
     """Return scan, annotation, and justification gates.
 
     Missing evidence stays BLOCKED. Source text and repository tests are not
-    evidence. A supplied document is PASS only when it is a successful scan of
-    the same production MCP URL, every tool sets the three boolean hints, and
-    each hint has a justification.
+    evidence. ``scan_required`` PASS requires a successful scan of the same
+    production MCP URL, a current timestamp, and a non-empty tools list. An
+    empty list is FAIL. Annotation and justification PASS require that scan
+    plus boolean hints and a justification for each hint.
     """
     if evidence is None:
         return _tool_scan_blocked()
@@ -199,19 +200,20 @@ def production_tool_scan_items(mcp_url: str | None, evidence: Any) -> list[dict[
         and evidence.get("scan_status") == "success"
         and _timestamp_ok(evidence.get("scanned_at"))
         and isinstance(tools, list)
+        and len(tools) > 0
     )
     if scan_ok:
         scan_item = _item(
             "scan_required",
             "PASS",
-            "owner supplied a successful tool scan of the supplied production MCP URL",
+            "owner supplied a successful non-empty tool scan of the supplied production MCP URL",
             "submission",
         )
     else:
         scan_item = _item(
             "scan_required",
             "FAIL",
-            "tool scan evidence is not a successful current scan of the supplied production MCP URL",
+            "tool scan evidence is not a successful current scan of the supplied production MCP URL with a non-empty tools list",
             "submission",
         )
 
@@ -224,9 +226,6 @@ def production_tool_scan_items(mcp_url: str | None, evidence: Any) -> list[dict[
         justification_failures.append(
             "justifications are accepted only from a successful current production scan"
         )
-    elif not isinstance(tools, list) or not tools:
-        annotation_failures.append("production scan did not list MCP tools")
-        justification_failures.append("production scan did not list MCP tools")
     else:
         for index, tool in enumerate(tools):
             label = f"tools[{index}]"

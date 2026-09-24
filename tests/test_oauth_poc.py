@@ -50,10 +50,9 @@ class OAuthRelayTestCase(unittest.TestCase):
         self.relay_port = _free_port()
         self.public_base = f"http://127.0.0.1:{self.relay_port}"
         self.resource = f"{self.public_base}/mcp"
+        self.upstream_mcp_url = f"http://127.0.0.1:{self.upstream_port}/mcp"
         env = {
-            "DRLINK_RELAY_UPSTREAM_URL": f"http://127.0.0.1:{self.upstream_port}/mcp",
             "DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM": "1",
-            "DRLINK_RELAY_UPSTREAM_TOKEN": "upstream-secret-token",
             "DRLINK_RELAY_BIND": "127.0.0.1",
             "DRLINK_RELAY_PORT": str(self.relay_port),
             "DRLINK_RELAY_TIMEOUT_S": "5",
@@ -224,7 +223,7 @@ class OAuthRelayTestCase(unittest.TestCase):
             "POST",
             "/bindings",
             body={
-                "upstream_url": self.config.upstream_url,
+                "upstream_url": self.upstream_mcp_url,
                 "upstream_token": "upstream-secret-token",
             },
             headers={"Authorization": f"Bearer {access_token}"},

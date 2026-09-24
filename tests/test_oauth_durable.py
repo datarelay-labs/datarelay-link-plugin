@@ -36,9 +36,6 @@ def _oauth_config(state_path: str, *, port: int | None = None) -> object:
     bind_port = port if port is not None else _free_port()
     return load_config(
         {
-            "DRLINK_RELAY_UPSTREAM_URL": "http://127.0.0.1:9/mcp",
-            "DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM": "1",
-            "DRLINK_RELAY_UPSTREAM_TOKEN": "upstream-secret-token",
             "DRLINK_RELAY_BIND": "127.0.0.1",
             "DRLINK_RELAY_PORT": str(bind_port),
             "DRLINK_RELAY_AUTH_MODE": "oauth",

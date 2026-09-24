@@ -31,7 +31,10 @@ explicitly connected upstream DRLink MCP servers.
 ## OAuth PoC constraints
 
 - Exactly one configured owner approval secret (`DRLINK_RELAY_OWNER_APPROVAL_SECRET`).
-- OAuth MCP calls do not use the process-global `DRLINK_RELAY_UPSTREAM_URL`.
+- OAuth mode does not read `DRLINK_RELAY_UPSTREAM_URL`, its resolved addresses,
+  or `DRLINK_RELAY_UPSTREAM_TOKEN`. Those settings are mock-mode-only.
+  A subject with no connected server fails closed. There is no process-global
+  upstream fallback.
   A subject connects a server with `POST /bindings` (`upstream_url`, optional
   `upstream_token`). The relay pins that server's addresses, stores the bearer
   only in the durable state file, and never returns it. `GET /bindings` lists
@@ -41,8 +44,8 @@ explicitly connected upstream DRLink MCP servers.
   purges the stored upstream bearer. The denial survives restart because the
   record is gone.
   A subject cannot resolve, activate, or disconnect another subject's binding.
-- `DRLINK_RELAY_UPSTREAM_URL` remains the mock-mode upstream and is still
-  required at process start. It is not an implicit OAuth route.
+- Mock mode requires `DRLINK_RELAY_UPSTREAM_URL` at process start. OAuth mode
+  starts without it.
 - Durable state schema v2 (`DRLINK_RELAY_OAUTH_STATE_PATH`) persists DCR
   clients, refresh/revocation records, and `server_bindings`. v1 files load as
   v2 with an empty binding map and are rewritten on the next save.

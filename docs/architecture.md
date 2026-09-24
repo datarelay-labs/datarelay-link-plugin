@@ -21,8 +21,8 @@ This repository must not modify `datarelay-labs/datarelay-link`. Core MCP intero
 
 ## Packet 1 relay contract
 
-- Mock mode uses exactly one configured upstream DRLink MCP URL.
-- OAuth mode routes each Plugin subject only to DRLink servers that subject explicitly connected.
+- Mock mode uses exactly one configured upstream DRLink MCP URL and refuses to start without it.
+- OAuth mode has no process-global upstream URL, resolved addresses, or token. It routes each Plugin subject only to DRLink servers that subject explicitly connected, and an unbound subject fails closed.
 - Pass-through of `initialize`, `tools/list`, `tools/call`, and JSON-RPC errors.
 - Preserve JSON-RPC `id` / result / error payloads.
 - Preserve/forward MCP protocol headers (`Mcp-Session-Id`, `Last-Event-ID`, `Accept`, `Content-Type`).

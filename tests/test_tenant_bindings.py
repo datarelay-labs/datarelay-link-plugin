@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from relay.binding import BindingError
+from relay.config import ConfigError, load_config
 from relay.oauth_state import STATE_VERSION, DurableOAuthStore
 from relay.server import create_server
 from relay.tenant_bindings import MAX_BINDINGS_PER_SUBJECT, TenantBindingRegistry
@@ -33,6 +34,48 @@ class TenantBindingRegistryTests(unittest.TestCase):
             public_base_url="http://127.0.0.1:8741",
             store=store,
         )
+
+    def test_oauth_config_boots_without_global_upstream(self) -> None:
+        cfg = load_config(
+            {
+                "DRLINK_RELAY_AUTH_MODE": "oauth",
+                "DRLINK_RELAY_BIND": "127.0.0.1",
+                "DRLINK_RELAY_PORT": "8741",
+                "DRLINK_RELAY_PUBLIC_BASE_URL": "http://127.0.0.1:8741",
+                "DRLINK_RELAY_OWNER_APPROVAL_SECRET": "owner-approval-secret-32chars!!",
+                "DRLINK_RELAY_OAUTH_ALLOW_EPHEMERAL": "1",
+            }
+        )
+        self.assertIsNone(cfg.upstream_url)
+        self.assertEqual(cfg.upstream_connect_ips, ())
+        self.assertIsNone(cfg.upstream_token)
+        self.assertEqual(cfg.auth_mode, "oauth")
+
+        ignored = load_config(
+            {
+                "DRLINK_RELAY_AUTH_MODE": "oauth",
+                "DRLINK_RELAY_BIND": "127.0.0.1",
+                "DRLINK_RELAY_PORT": "8741",
+                "DRLINK_RELAY_PUBLIC_BASE_URL": "http://127.0.0.1:8741",
+                "DRLINK_RELAY_OWNER_APPROVAL_SECRET": "owner-approval-secret-32chars!!",
+                "DRLINK_RELAY_OAUTH_ALLOW_EPHEMERAL": "1",
+                "DRLINK_RELAY_UPSTREAM_URL": "http://example.com/mcp",
+                "DRLINK_RELAY_UPSTREAM_TOKEN": "global-upstream-secret",
+            }
+        )
+        self.assertIsNone(ignored.upstream_url)
+        self.assertEqual(ignored.upstream_connect_ips, ())
+        self.assertIsNone(ignored.upstream_token)
+
+    def test_mock_config_rejects_missing_upstream(self) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            load_config(
+                {
+                    "DRLINK_RELAY_AUTH_MODE": "mock",
+                    "DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM": "1",
+                }
+            )
+        self.assertIn("DRLINK_RELAY_UPSTREAM_URL is required", str(ctx.exception))
 
     def test_v1_state_migrates_to_v2_without_dropping_oauth_records(self) -> None:
         path = Path(self.state_path)
@@ -303,6 +346,47 @@ class TenantBindingHttpTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.fx.close()
+
+    def test_unbound_mcp_fail_closed_then_subject_binding_proxies(self) -> None:
+        self.assertIsNone(self.fx.config.upstream_url)
+        self.assertIsNone(self.fx.config.upstream_token)
+        self.assertEqual(self.fx.config.upstream_connect_ips, ())
+        redirect = "https://chatgpt.com/connector/oauth/__test__"
+        client_id = self.fx._register(redirect)
+        verifier, challenge = _pkce_pair()
+        token = self.fx._authorize_and_token(
+            client_id=client_id,
+            redirect_uri=redirect,
+            verifier=verifier,
+            challenge=challenge,
+        )
+        status, _, body = self.fx._json(
+            "POST",
+            "/mcp",
+            body={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            headers={"Authorization": f"Bearer {token['access_token']}"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("no connected DRLink server", json.dumps(body))
+        self.assertEqual(self.fx.upstream.requests, [])
+
+        self.fx._connect_upstream(token["access_token"])
+        status, _, proxied = self.fx._json(
+            "POST",
+            "/mcp",
+            body={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            headers={"Authorization": f"Bearer {token['access_token']}"},
+        )
+        self.assertEqual(status, 200, proxied)
+        self.assertTrue(self.fx.upstream.requests)
+        self.assertEqual(
+            self.fx.upstream.requests[-1]["headers"].get("Authorization"),
+            "Bearer upstream-secret-token",
+        )
+        self.assertNotEqual(
+            self.fx.upstream.requests[-1]["headers"].get("Authorization"),
+            f"Bearer {token['access_token']}",
+        )
 
     def test_unconnected_subject_is_not_an_open_proxy(self) -> None:
         redirect = "https://chatgpt.com/connector/oauth/__test__"

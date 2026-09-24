@@ -43,6 +43,8 @@ class UpstreamBinding:
 
 
 def _upstream_binding(config: RelayConfig, *, binding_id: str, subject: str) -> UpstreamBinding:
+    if not config.upstream_url:
+        raise BindingError("upstream not configured")
     upstream_auth = None
     if config.upstream_token:
         upstream_auth = f"Bearer {config.upstream_token}"

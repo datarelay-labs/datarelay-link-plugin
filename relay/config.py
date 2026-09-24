@@ -24,7 +24,7 @@ AUTH_MODE_OAUTH = "oauth"
 class RelayConfig:
     bind_host: str
     bind_port: int
-    upstream_url: str
+    upstream_url: str | None
     upstream_connect_ips: tuple[str, ...]
     upstream_token: str | None
     allow_loopback_upstream: bool
@@ -162,13 +162,6 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
         "yes",
         "YES",
     }
-    upstream = validate_upstream_binding(
-        env.get("DRLINK_RELAY_UPSTREAM_URL", ""),
-        allow_loopback=allow_loopback,
-    )
-    token = env.get("DRLINK_RELAY_UPSTREAM_TOKEN") or None
-    if token is not None:
-        token = token.strip() or None
 
     bind_host = (env.get("DRLINK_RELAY_BIND") or "127.0.0.1").strip()
     port_raw = (env.get("DRLINK_RELAY_PORT") or "8741").strip()
@@ -190,6 +183,22 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
     auth_mode = (env.get("DRLINK_RELAY_AUTH_MODE") or AUTH_MODE_MOCK).strip().lower()
     if auth_mode not in {AUTH_MODE_MOCK, AUTH_MODE_OAUTH}:
         raise ConfigError("DRLINK_RELAY_AUTH_MODE must be 'mock' or 'oauth'")
+
+    # Global upstream URL, pinned addresses, and token exist only for mock mode.
+    # OAuth routing uses per-subject /bindings and must not retain a fallback.
+    upstream_url: str | None = None
+    upstream_connect_ips: tuple[str, ...] = ()
+    token: str | None = None
+    if auth_mode == AUTH_MODE_MOCK:
+        upstream = validate_upstream_binding(
+            env.get("DRLINK_RELAY_UPSTREAM_URL", ""),
+            allow_loopback=allow_loopback,
+        )
+        upstream_url = upstream.url
+        upstream_connect_ips = upstream.connect_ips
+        raw_token = env.get("DRLINK_RELAY_UPSTREAM_TOKEN") or None
+        if raw_token is not None:
+            token = raw_token.strip() or None
 
     explicit_mock_token = env.get("DRLINK_RELAY_MOCK_PLUGIN_TOKEN")
     if explicit_mock_token is None:
@@ -304,8 +313,8 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
     return RelayConfig(
         bind_host=bind_host,
         bind_port=bind_port,
-        upstream_url=upstream.url,
-        upstream_connect_ips=upstream.connect_ips,
+        upstream_url=upstream_url,
+        upstream_connect_ips=upstream_connect_ips,
         upstream_token=token,
         allow_loopback_upstream=allow_loopback,
         mock_plugin_token=mock_plugin_token,

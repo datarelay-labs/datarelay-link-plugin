@@ -53,12 +53,14 @@ PYTHONPATH=. python3 -m relay
 
 MCP: `POST http://127.0.0.1:8741/mcp` with `Authorization: Bearer dev-plugin-token`
 
-### OAuth mode (single-user ChatGPT-compatible PoC)
+### OAuth mode
+
+OAuth does not use a process-global upstream URL or token. Each Plugin subject
+connects its own DRLink server after authentication. Set
+`DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM=1` only when a subject will connect a
+loopback DRLink server.
 
 ```bash
-export DRLINK_RELAY_UPSTREAM_URL="http://127.0.0.1:9000/mcp"
-export DRLINK_RELAY_ALLOW_LOOPBACK_UPSTREAM=1
-export DRLINK_RELAY_UPSTREAM_TOKEN="replace-me"
 export DRLINK_RELAY_AUTH_MODE=oauth
 export DRLINK_RELAY_PUBLIC_BASE_URL="http://127.0.0.1:8741"
 export DRLINK_RELAY_OWNER_APPROVAL_SECRET="replace-with-long-runtime-secret"
@@ -89,8 +91,10 @@ curl -sS -X POST "$DRLINK_RELAY_PUBLIC_BASE_URL/bindings" \
   -d '{"upstream_url":"https://customer-drlink.example/mcp","upstream_token":"replace-me"}'
 ```
 
-OAuth `/mcp` calls use that connected server. The process-global
-`DRLINK_RELAY_UPSTREAM_URL` is the mock-mode upstream only. Public HTTPS
+OAuth `/mcp` calls use that connected server. A subject with no connected
+server is rejected. `DRLINK_RELAY_UPSTREAM_URL` and
+`DRLINK_RELAY_UPSTREAM_TOKEN` are mock-mode settings and are not read in OAuth
+mode. Public HTTPS
 deployment URLs remain configurable; this repo does not claim public Plugin
 availability.
 

@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 from jsonschema import Draft202012Validator
 
 ROOT = Path(__file__).resolve().parents[1]
+AGENT_PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+AGENT_MCP_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
 
 _SECRET_KEYS = {
     "authorization",
@@ -179,6 +181,49 @@ def render_mcp_document(document: dict[str, Any], mcp_url: str, *, allow_loopbac
     return rendered
 
 
+def resolve_canonical_interface(portable: Any, fallback: Any) -> tuple[dict[str, Any] | None, str]:
+    """Return the OpenAI interface from root plugin.json, or a failure reason.
+
+    ``.codex-plugin/plugin.json`` is a compatibility fallback. It is not read
+    as the source of interface fields. When ``extensions.com.openai`` is
+    present, official docs replace the overlay with that object and do not
+    merge the two files.
+    """
+    if not isinstance(portable, dict):
+        return None, "root plugin.json is missing or invalid"
+    if portable.get("$schema") != AGENT_PLUGIN_SCHEMA:
+        return None, "root plugin.json must declare the Agent Plugins schema"
+    if portable.get("name") != "datarelay-link":
+        return None, "root plugin.json name must be datarelay-link"
+    extensions = portable.get("extensions")
+    openai = extensions.get("com.openai") if isinstance(extensions, dict) else None
+    if not isinstance(openai, dict):
+        return None, "OpenAI settings must live under root extensions.com.openai"
+    if "apps" in openai or "mcpServers" in openai:
+        return None, "portable OpenAI extension must not claim apps or mcpServers"
+    interface = openai.get("interface")
+    prompts = interface.get("defaultPrompt") if isinstance(interface, dict) else None
+    if (
+        not isinstance(interface, dict)
+        or not isinstance(interface.get("displayName"), str)
+        or not isinstance(prompts, list)
+        or len(prompts) < 1
+    ):
+        return None, "extensions.com.openai.interface is missing displayName or starter prompts"
+    if not isinstance(fallback, dict):
+        return None, "compatibility fallback .codex-plugin/plugin.json is missing"
+    if "$schema" in fallback or "extensions" in fallback:
+        return None, "compatibility fallback must not imitate the portable manifest"
+    if "apps" in fallback or "mcpServers" in fallback:
+        return None, "compatibility fallback must not claim apps or mcpServers"
+    if fallback.get("interface") != interface:
+        return None, "compatibility fallback interface must match the canonical interface"
+    return interface, (
+        "root plugin.json extensions.com.openai.interface is canonical; "
+        ".codex-plugin/plugin.json is a matching compatibility fallback"
+    )
+
+
 def _status(ok: bool) -> str:
     return "PASS" if ok else "FAIL"
 
@@ -227,8 +272,8 @@ def evaluate(root: Path | None = None, *, mode: str, mcp_url: str | None = None)
     base = root or ROOT
     items: list[dict[str, str]] = []
 
-    canonical = base / ".codex-plugin" / "plugin.json"
-    portable = base / "plugin.json"
+    canonical = base / "plugin.json"
+    fallback_path = base / ".codex-plugin" / "plugin.json"
     portable_mcp = base / "mcp.json"
     cases_path = base / "docs" / "submission" / "review-cases.json"
     server_py = base / "relay" / "server.py"
@@ -236,67 +281,47 @@ def evaluate(root: Path | None = None, *, mode: str, mcp_url: str | None = None)
     prompts: list[Any] | None = None
     dev_loopback = False
 
-    interface_reason = "canonical .codex-plugin/plugin.json top-level interface is present"
+    interface_reason = "root plugin.json is missing or invalid"
     interface_ok = False
     try:
-        manifest = _load_json(canonical)
-        portable_doc = _load_json(portable)
-        interface = manifest.get("interface") if isinstance(manifest, dict) else None
+        portable_doc = _load_json(canonical)
+        fallback_doc = _load_json(fallback_path)
+        interface, interface_reason = resolve_canonical_interface(portable_doc, fallback_doc)
         prompts = interface.get("defaultPrompt") if isinstance(interface, dict) else None
-        manifest_text = canonical.read_text(encoding="utf-8")
+        package_text = canonical.read_text(encoding="utf-8") + fallback_path.read_text(encoding="utf-8")
         false_wiring = (base / ".mcp.json").exists() or (base / ".app.json").exists()
-        claimed_wiring = isinstance(manifest, dict) and (
-            "apps" in manifest or "mcpServers" in manifest
-        )
-        fabricated_id = "plugin_asdk_app" in manifest_text
-        interface_ok = (
-            isinstance(manifest, dict)
-            and manifest.get("name") == "datarelay-link"
-            and isinstance(interface, dict)
-            and isinstance(interface.get("displayName"), str)
-            and isinstance(prompts, list)
-            and len(prompts) >= 1
-            and "extensions" not in manifest
-            and "extensions" not in portable_doc
-            and not false_wiring
-            and not claimed_wiring
-            and not fabricated_id
-        )
-        if false_wiring or claimed_wiring or fabricated_id:
+        fabricated_id = "plugin_asdk_app" in package_text
+        interface_ok = interface is not None and not false_wiring and not fabricated_id
+        if false_wiring or fabricated_id:
             interface_reason = (
-                "canonical manifest must not claim apps, mcpServers, .mcp.json, "
-                ".app.json, or a plugin_asdk_app id"
+                "package must not add .mcp.json, .app.json, or a fabricated plugin_asdk_app id"
             )
-        elif not interface_ok:
-            interface_reason = "canonical plugin manifest is missing documented interface fields"
+            interface = None
+            prompts = None
     except (OSError, json.JSONDecodeError, AttributeError):
         interface_reason = "canonical plugin manifest is missing or invalid"
         prompts = None
     items.append(
         _item("canonical_interface", _status(interface_ok), interface_reason, "repository")
     )
-    wiring_reason = (
-        "OWNER/PLATFORM BLOCKED: OpenAI MCP install wiring needs apps to point at a "
-        "real .app.json plugin_asdk_app mapping from ChatGPT developer mode. This "
-        "repository does not invent that id. Current docs do not document remote "
-        "streamable-http inside .mcp.json; portable MCP stays in root mcp.json. "
-        "package_layout PASS requires that documented wiring, not file existence."
-    )
-    if not interface_ok:
-        items.append(_item("package_layout", "FAIL", interface_reason, "repository"))
-        items.append(_item("mcp_package_wiring", "FAIL", interface_reason, "repository"))
-    else:
-        items.append(_item("package_layout", "BLOCKED", wiring_reason, "submission"))
-        items.append(_blocked("mcp_package_wiring", wiring_reason))
+    layout_reason = interface_reason
+    if interface_ok:
+        layout_reason = (
+            "canonical root plugin.json uses the Agent Plugins schema and "
+            "extensions.com.openai; .codex-plugin/plugin.json is fallback only"
+        )
+    items.append(_item("package_layout", _status(interface_ok), layout_reason, "repository"))
 
     secret_fail = False
     url_fail_reason = ""
     try:
         document = _load_json(portable_mcp)
+        if document.get("$schema") != AGENT_MCP_SCHEMA:
+            raise PackageError("root mcp.json must declare the Agent Plugins MCP schema")
         entries = _server_entries(document)
         plugin_schema = _load_json(base / "schemas" / "plugin.schema.json")
         mcp_schema = _load_json(base / "schemas" / "mcp.schema.json")
-        Draft202012Validator(plugin_schema).validate(_load_json(portable))
+        Draft202012Validator(plugin_schema).validate(_load_json(canonical))
         Draft202012Validator(mcp_schema).validate(document)
         found: list[str] = []
         _walk_secret_keys(document, found)
@@ -316,11 +341,30 @@ def evaluate(root: Path | None = None, *, mode: str, mcp_url: str | None = None)
         url_fail_reason = str(exc)
         secret_fail = True
 
+    mcp_ok = not secret_fail and not url_fail_reason
+    mcp_reason = url_fail_reason or (
+        "root mcp.json declares streamable-http under the Agent Plugins MCP schema; "
+        "the committed URL is the local PoC"
+    )
     items.append(
         _item(
             "portable_mcp_manifest",
-            _status(not secret_fail and not url_fail_reason),
-            url_fail_reason or "root mcp.json matches the portable streamable-http schema",
+            _status(mcp_ok),
+            mcp_reason,
+            "repository",
+        )
+    )
+    if mcp_ok and interface_ok:
+        wiring_reason = mcp_reason
+    elif not mcp_ok:
+        wiring_reason = url_fail_reason or "root mcp.json is not a portable streamable-http document"
+    else:
+        wiring_reason = interface_reason
+    items.append(
+        _item(
+            "mcp_package_wiring",
+            _status(mcp_ok and interface_ok),
+            wiring_reason,
             "repository",
         )
     )

@@ -10,7 +10,13 @@ import threading
 import unittest
 from urllib import error, request
 
-from plugin_readiness.readiness import PackageError, evaluate, render_mcp_document, validate_mcp_url
+from plugin_readiness.readiness import (
+    PackageError,
+    evaluate,
+    render_mcp_document,
+    resolve_canonical_interface,
+    validate_mcp_url,
+)
 from relay.config import ConfigError, load_config
 from relay.server import create_server
 from tests.test_relay_poc import ROOT, _free_port
@@ -53,20 +59,43 @@ class PackageContractTests(unittest.TestCase):
         self.assertEqual(completed.stdout.strip(), "1.2.3")
         self.assertFalse((ROOT / "packaging").exists())
 
-    def test_canonical_manifest_is_codex_plugin_without_inline_extension(self) -> None:
-        canonical = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    def test_canonical_manifest_is_root_plugin_with_openai_extension(self) -> None:
         portable = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(canonical["name"], "datarelay-link")
-        self.assertIn("displayName", canonical["interface"])
-        self.assertGreaterEqual(len(canonical["interface"]["defaultPrompt"]), 1)
-        self.assertNotIn("extensions", canonical)
-        self.assertNotIn("extensions", portable)
-        self.assertNotIn("apps", canonical)
-        self.assertNotIn("mcpServers", canonical)
-        self.assertNotIn("plugin_asdk_app", json.dumps(canonical))
+        fallback = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        mcp = json.loads((ROOT / "mcp.json").read_text(encoding="utf-8"))
+        interface, reason = resolve_canonical_interface(portable, fallback)
+        self.assertIsNotNone(interface, reason)
+        assert interface is not None
+        self.assertEqual(
+            portable["$schema"],
+            "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        )
+        self.assertEqual(portable["extensions"]["com.openai"]["interface"], interface)
+        self.assertEqual(fallback["interface"], interface)
+        self.assertNotIn("$schema", fallback)
+        self.assertNotIn("extensions", fallback)
+        self.assertNotIn("apps", portable["extensions"]["com.openai"])
+        self.assertNotIn("mcpServers", portable["extensions"]["com.openai"])
+        self.assertNotIn("apps", fallback)
+        self.assertNotIn("mcpServers", fallback)
+        self.assertNotIn("plugin_asdk_app", json.dumps(portable))
+        self.assertNotIn("plugin_asdk_app", json.dumps(fallback))
         self.assertFalse((ROOT / ".app.json").exists())
         self.assertFalse((ROOT / ".mcp.json").exists())
-        self.assertEqual(portable["license"], canonical["license"])
+        self.assertEqual(portable["license"], fallback["license"])
+        self.assertEqual(mcp["$schema"], "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json")
+        self.assertEqual(mcp["mcpServers"]["datarelay-link"]["type"], "streamable-http")
+        only_fallback = dict(portable)
+        only_fallback.pop("extensions")
+        missing, missing_reason = resolve_canonical_interface(only_fallback, fallback)
+        self.assertIsNone(missing)
+        self.assertIn("extensions.com.openai", missing_reason)
+        drifted = json.loads(json.dumps(fallback))
+        drifted["interface"] = dict(interface)
+        drifted["interface"]["displayName"] = "Other"
+        conflict, conflict_reason = resolve_canonical_interface(portable, drifted)
+        self.assertIsNone(conflict)
+        self.assertIn("must match", conflict_reason)
 
     def test_portable_mcp_is_documented_streamable_http_without_secrets(self) -> None:
         portable = json.loads((ROOT / "mcp.json").read_text(encoding="utf-8"))
@@ -150,8 +179,8 @@ class PackageContractTests(unittest.TestCase):
         by_id = {item["id"]: item["status"] for item in report["items"]}
         self.assertEqual(by_id["canonical_interface"], "PASS")
         self.assertEqual(by_id["portable_mcp_manifest"], "PASS")
-        self.assertEqual(by_id["package_layout"], "BLOCKED")
-        self.assertEqual(by_id["mcp_package_wiring"], "BLOCKED")
+        self.assertEqual(by_id["package_layout"], "PASS")
+        self.assertEqual(by_id["mcp_package_wiring"], "PASS")
         self.assertEqual(by_id["oauth_discovery"], "PASS")
         self.assertEqual(by_id["domain_challenge_code"], "PASS")
         self.assertEqual(by_id["tool_metadata_passthrough"], "PASS")
@@ -182,7 +211,8 @@ class PackageContractTests(unittest.TestCase):
         self.assertEqual(by_id["production_mcp_url"], "BLOCKED")
         self.assertEqual(by_id["website_support_privacy_terms"], "BLOCKED")
         self.assertEqual(by_id["openai_submission"], "BLOCKED")
-        self.assertNotEqual(by_id["package_layout"], "PASS")
+        self.assertEqual(by_id["package_layout"], "PASS")
+        self.assertEqual(by_id["mcp_package_wiring"], "PASS")
 
         insecure = evaluate(mode="submission", mcp_url="http://mcp.example.com/mcp")
         self._assert_not_submission_ready(insecure)
@@ -203,7 +233,8 @@ class PackageContractTests(unittest.TestCase):
         self.assertEqual(supplied_ids["reviewer_credentials"], "BLOCKED")
         self.assertEqual(supplied_ids["country_availability"], "BLOCKED")
         self.assertEqual(supplied_ids["publisher_identity"], "BLOCKED")
-        self.assertEqual(supplied_ids["mcp_package_wiring"], "BLOCKED")
+        self.assertEqual(supplied_ids["mcp_package_wiring"], "PASS")
+        self.assertEqual(supplied_ids["package_layout"], "PASS")
         self.assertEqual(supplied_ids["production_mcp_reachability"], "BLOCKED")
         self.assertEqual(supplied_ids["apps_management_permission"], "BLOCKED")
         self.assertEqual(supplied_ids["listing_logo_assets"], "BLOCKED")

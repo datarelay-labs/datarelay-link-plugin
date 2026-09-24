@@ -23,12 +23,12 @@ Fetched page behavior:
 
 Repository contract for this phase:
 
-1. OpenAI install-surface metadata is `.codex-plugin/plugin.json` with documented top-level `interface` fields. Root `plugin.json` omits `extensions` so that overlay stays active.
-2. The overlay does not set `apps` or `mcpServers`. Current docs use `apps` for a real `.app.json` mapping created only after ChatGPT developer mode registers an MCP connection and returns a `plugin_asdk_app` id. This repository does not invent that id, and it does not commit `.app.json`.
-3. Current docs do not show a remote `streamable-http` object inside `.mcp.json`. That file is omitted. Portable remote MCP, including transport `type`, is root `mcp.json`. The committed URL is the local PoC (`http://127.0.0.1:8741/mcp`).
-4. A production URL is an input to `scripts/submission-readiness.py`. Missing owner input is BLOCKED. An explicitly supplied URL is FAIL when it is not HTTPS, not exactly `/mcp`, has a query or fragment, embeds credentials, or uses a loopback, private, link-local, metadata, or reserved literal address. The checker does not probe DNS. Hostname reachability stays BLOCKED.
-5. `package_layout` is PASS only when that registered app mapping is actually wired. Until then it stays OWNER/PLATFORM BLOCKED. `repository_checks_ok` can still be true. `submission_ready` stays false, and `overall_status` stays BLOCKED, while any submission prerequisite is BLOCKED.
-6. `privacyPolicyURL` and `termsOfServiceURL` are omitted until the owner approves public legal pages.
+1. The canonical package is root `plugin.json` with the Agent Plugins `$schema`. OpenAI presentation lives under `extensions.com.openai.interface`. `privacyPolicyURL` and `termsOfServiceURL` stay omitted until the owner approves public legal pages.
+2. `.codex-plugin/plugin.json` is a compatibility fallback. Its top-level `interface` matches the canonical interface. When `extensions.com.openai` is present, OpenAI replaces the overlay with that object and does not merge the two files. The readiness checker reads interface fields only from the root extension.
+3. The extension and the fallback do not set `apps` or `mcpServers`. This repository does not invent a `plugin_asdk_app` id and does not commit `.app.json` or `.mcp.json`.
+4. Portable remote MCP is root `mcp.json` with the Agent Plugins MCP schema and `type: streamable-http`. The committed URL is the local PoC (`http://127.0.0.1:8741/mcp`).
+5. A production URL is an input to `scripts/submission-readiness.py`. Missing owner input is BLOCKED. An explicitly supplied URL is FAIL when it is not HTTPS, not exactly `/mcp`, has a query or fragment, embeds credentials, or uses a loopback, private, link-local, metadata, or reserved literal address. The checker does not probe DNS. Hostname reachability stays BLOCKED.
+6. `package_layout` and `mcp_package_wiring` PASS when that portable contract holds. `repository_checks_ok` can be true while `submission_ready` stays false and `overall_status` stays BLOCKED, because owner and platform prerequisites remain BLOCKED.
 7. This repository does not create DNS, activate a live challenge token, or submit the plugin. It ships no skills and no custom UI.
 
 ## MCP wire behavior

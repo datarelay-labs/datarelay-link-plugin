@@ -25,8 +25,9 @@ See [docs/architecture.md](docs/architecture.md) and [docs/openai-plugin-assumpt
 
 | Path | Purpose |
 | --- | --- |
-| `.codex-plugin/plugin.json` | OpenAI install-surface manifest (top-level `interface` only) |
-| `plugin.json` / `mcp.json` | Portable Agent Plugins manifests. `mcp.json` is the documented streamable-http declaration |
+| `plugin.json` | Canonical portable Agent Plugins manifest. OpenAI settings are under `extensions.com.openai` |
+| `.codex-plugin/plugin.json` | Compatibility fallback. OpenAI ignores it when the root extension object is present |
+| `mcp.json` | Portable MCP configuration (`streamable-http`). The committed URL is the local PoC |
 | `docs/submission/review-cases.json` | 5 positive and 3 negative reviewer fixtures |
 | `relay/` | Streamable HTTP MCP relay. Mock mode is single-upstream; OAuth mode binds each Plugin subject to explicitly connected DRLink servers. |
 | `schemas/` | Vendored Agent Plugins JSON Schemas for local validation |
@@ -106,9 +107,8 @@ The default mock token is loopback-only. Non-loopback bind should use `oauth`
 mode. Legacy mock-on-public requires both `DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND=1`
 and an explicit non-default `DRLINK_RELAY_MOCK_PLUGIN_TOKEN`.
 
-`mcp.json` points at the local PoC relay URL. There is no `.mcp.json` and no
-`.app.json`: current docs do not show remote streamable-http inside `.mcp.json`,
-and `.app.json` is valid only after ChatGPT developer mode returns a real
+`mcp.json` points at the local PoC relay URL and declares `streamable-http`.
+There is no `.mcp.json` and no `.app.json`. This repository does not invent a
 `plugin_asdk_app` id. Production HTTPS and Plugin Directory submission are not
 performed from this repository. Check readiness without contacting OpenAI:
 

@@ -86,7 +86,11 @@ class TenantBindingRegistry:
             raise BindingError(str(exc), status=400) from exc
 
         with self._lock:
-            owned = [rec for rec in self._records.values() if rec.subject == subject]
+            owned = [
+                rec
+                for rec in self._records.values()
+                if rec.subject == subject and rec.connected
+            ]
             if len(owned) >= MAX_BINDINGS_PER_SUBJECT:
                 raise BindingError("binding limit reached", status=400)
             binding_id = _new_binding_id(set(self._records))
@@ -119,20 +123,21 @@ class TenantBindingRegistry:
             return [_public_view(rec) for rec in owned]
 
     def disconnect(self, *, subject: str, binding_id: str) -> dict[str, Any]:
+        """Revoke the binding, free its slot, and purge the stored bearer."""
         with self._lock:
-            record = self._owned(subject, binding_id)
-            previous = (record.connected, record.active)
-            record.connected = False
-            record.active = False
+            self._owned(subject, binding_id)
+            removed = self._records.pop(binding_id)
+        view = _public_view(removed)
+        view["connected"] = False
+        view["active"] = False
         try:
             self._persist_from_memory()
         except BindingError:
             with self._lock:
-                current = self._records.get(binding_id)
-                if current is not None and current.subject == subject:
-                    current.connected, current.active = previous
+                self._records[binding_id] = removed
             raise
-        return _public_view(record)
+        removed.upstream_bearer = None
+        return view
 
     def activate(self, *, subject: str, binding_id: str) -> dict[str, Any]:
         with self._lock:
@@ -247,14 +252,7 @@ class TenantBindingRegistry:
     def _assert_not_relay(self, url: str) -> None:
         if not self._public_base_url:
             return
-        target = urlparse(url)
-        public = urlparse(self._public_base_url)
-        same_origin = (
-            (target.scheme or "").lower() == (public.scheme or "").lower()
-            and (target.hostname or "").lower() == (public.hostname or "").lower()
-            and target.port == public.port
-        )
-        if same_origin:
+        if _origin_key(url) == _origin_key(self._public_base_url):
             raise BindingError("upstream must not target the relay", status=400)
 
     def _load_map(self, raw: Any) -> None:
@@ -268,14 +266,21 @@ class TenantBindingRegistry:
                 record = _from_disk(key, value)
             except (KeyError, TypeError, ValueError) as exc:
                 raise OAuthStateError("invalid durable server binding") from exc
+            if not record.connected:
+                # Disconnected rows are revocation tombstones with no lifecycle
+                # purpose. Drop them, including any retained upstream bearer.
+                continue
             try:
                 for ip in record.connect_ips:
                     assert_connect_ip_allowed(ip, allow_loopback=self._allow_loopback)
             except ConfigError as exc:
                 raise OAuthStateError("durable server binding has a blocked address") from exc
             loaded[key] = record
+        purged = len(loaded) != len(raw)
         self._records = loaded
         self._normalize_active_locked()
+        if purged:
+            self._persist_from_memory()
 
     def _persist_from_memory(self) -> None:
         """Write current records. Caller must not hold ``self._lock``."""
@@ -293,6 +298,25 @@ class TenantBindingRegistry:
             self._store.update(_mutate)
         except OAuthStateError as exc:
             raise BindingError("binding state unavailable", status=500) from exc
+
+
+def _effective_port(scheme: str, port: int | None) -> int | None:
+    """Map omitted ports to the scheme default so :443 is the same origin as https."""
+    normalized = scheme.lower()
+    if port is not None:
+        return port
+    if normalized == "https":
+        return 443
+    if normalized == "http":
+        return 80
+    return None
+
+
+def _origin_key(url: str) -> tuple[str, str, int | None]:
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    return scheme, host, _effective_port(scheme, parsed.port)
 
 
 def _new_binding_id(existing: set[str]) -> str:

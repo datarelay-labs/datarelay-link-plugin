@@ -37,7 +37,9 @@ explicitly connected upstream DRLink MCP servers.
   only in the durable state file, and never returns it. `GET /bindings` lists
   id, host, connected, and active. `POST /bindings/{id}/activate` selects the
   server used when `X-DRLink-Server-Binding` is absent.
-  `POST /bindings/{id}/disconnect` makes that server fail closed across restart.
+  `POST /bindings/{id}/disconnect` deletes that binding, frees its slot, and
+  purges the stored upstream bearer. The denial survives restart because the
+  record is gone.
   A subject cannot resolve, activate, or disconnect another subject's binding.
 - `DRLINK_RELAY_UPSTREAM_URL` remains the mock-mode upstream and is still
   required at process start. It is not an implicit OAuth route.

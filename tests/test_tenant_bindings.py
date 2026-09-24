@@ -13,7 +13,7 @@ from pathlib import Path
 from relay.binding import BindingError
 from relay.oauth_state import STATE_VERSION, DurableOAuthStore
 from relay.server import create_server
-from relay.tenant_bindings import TenantBindingRegistry
+from relay.tenant_bindings import MAX_BINDINGS_PER_SUBJECT, TenantBindingRegistry
 from tests.test_oauth_poc import OAuthRelayTestCase
 from tests.test_relay_poc import MockUpstream, _free_port
 
@@ -164,11 +164,121 @@ class TenantBindingRegistryTests(unittest.TestCase):
             "https://10.0.0.8/mcp",
             "http://example.com/mcp",
             "http://127.0.0.1:9/mcp",
-            "https://mcp.datarelay.run/mcp",
             "https://user:pass@example.com/mcp",
         ):
             with self.assertRaises(BindingError):
                 registry.connect(subject="tn_a", upstream_url=url, upstream_token="x")
+        for url in (
+            "https://mcp.datarelay.run/mcp",
+            "https://mcp.datarelay.run:443/mcp",
+            "https://MCP.DATARELAY.RUN:443/mcp",
+        ):
+            with self.assertRaises(BindingError) as ctx:
+                registry.connect(subject="tn_a", upstream_url=url, upstream_token="x")
+            self.assertEqual(str(ctx.exception), "upstream must not target the relay")
+
+        implicit_http = TenantBindingRegistry(
+            allow_loopback=True,
+            public_base_url="http://127.0.0.1",
+            store=None,
+        )
+        with self.assertRaises(BindingError) as ctx:
+            implicit_http.connect(
+                subject="tn_a",
+                upstream_url="http://127.0.0.1:80/mcp",
+                upstream_token=None,
+            )
+        self.assertEqual(str(ctx.exception), "upstream must not target the relay")
+        other_port = implicit_http.connect(
+            subject="tn_a",
+            upstream_url="http://127.0.0.1:9/mcp",
+            upstream_token=None,
+        )
+        self.assertTrue(other_port["connected"])
+
+    def test_disconnect_purges_bearer_and_frees_slot(self) -> None:
+        registry = self._registry(self.state_path)
+        for index in range(MAX_BINDINGS_PER_SUBJECT):
+            view = registry.connect(
+                subject="tn_a",
+                upstream_url=f"http://127.0.0.1:{9100 + index}/mcp",
+                upstream_token=f"secret-cycle-{index}",
+            )
+            self.assertTrue(view["connected"])
+            registry.disconnect(subject="tn_a", binding_id=view["binding_id"])
+        ninth = registry.connect(
+            subject="tn_a",
+            upstream_url="http://127.0.0.1:9199/mcp",
+            upstream_token="secret-ninth",
+        )
+        raw = Path(self.state_path).read_text(encoding="utf-8")
+        self.assertNotIn("secret-cycle-", raw)
+        self.assertIn("secret-ninth", raw)
+        registry.disconnect(subject="tn_a", binding_id=ninth["binding_id"])
+        raw = Path(self.state_path).read_text(encoding="utf-8")
+        self.assertNotIn("secret-ninth", raw)
+        self.assertNotIn("upstream_bearer", raw)
+        self.assertEqual(registry.list_bindings("tn_a"), [])
+        reloaded = self._registry(self.state_path)
+        with self.assertRaises(BindingError):
+            reloaded.resolve(subject="tn_a", binding_id=ninth["binding_id"])
+
+        held = []
+        for index in range(MAX_BINDINGS_PER_SUBJECT):
+            held.append(
+                registry.connect(
+                    subject="tn_a",
+                    upstream_url=f"http://127.0.0.1:{9200 + index}/mcp",
+                    upstream_token=None,
+                )
+            )
+        with self.assertRaises(BindingError) as ctx:
+            registry.connect(
+                subject="tn_a",
+                upstream_url="http://127.0.0.1:9299/mcp",
+                upstream_token=None,
+            )
+        self.assertEqual(str(ctx.exception), "binding limit reached")
+        registry.disconnect(subject="tn_a", binding_id=held[0]["binding_id"])
+        freed = registry.connect(
+            subject="tn_a",
+            upstream_url="http://127.0.0.1:9299/mcp",
+            upstream_token=None,
+        )
+        self.assertTrue(freed["connected"])
+
+    def test_reload_purges_disconnected_bearer(self) -> None:
+        DurableOAuthStore(self.state_path).save(
+            {
+                "version": STATE_VERSION,
+                "clients": {},
+                "refresh_tokens": {},
+                "server_bindings": {
+                    "bnd_old": {
+                        "binding_id": "bnd_old",
+                        "subject": "tn_a",
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "upstream_host": "127.0.0.1",
+                        "connect_ips": ["127.0.0.1"],
+                        "allow_loopback": True,
+                        "upstream_bearer": "stale-bearer-secret",
+                        "connected": False,
+                        "active": False,
+                        "created_at": 1,
+                    }
+                },
+            }
+        )
+        registry = self._registry(self.state_path)
+        raw = Path(self.state_path).read_text(encoding="utf-8")
+        self.assertNotIn("stale-bearer-secret", raw)
+        self.assertNotIn("bnd_old", raw)
+        view = registry.connect(
+            subject="tn_a",
+            upstream_url="http://127.0.0.1:9/mcp",
+            upstream_token="fresh-bearer",
+        )
+        self.assertTrue(view["connected"])
 
 
 class _RelayFixture:

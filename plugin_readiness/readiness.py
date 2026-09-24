@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -43,6 +44,7 @@ _POSITIVE_FIELDS = (
     "fixture_data",
 )
 _NEGATIVE_FIELDS = ("expected_fallback", "why_not_complete")
+_ANNOTATION_HINTS = ("readOnlyHint", "openWorldHint", "destructiveHint")
 
 
 class PackageError(ValueError):
@@ -118,6 +120,166 @@ def _review_cases_ok(cases: Any) -> bool:
         if not all(_nonempty(case.get(field)) for field in _NEGATIVE_FIELDS):
             return False
     return True
+
+
+def _timestamp_ok(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        return False
+    return parsed <= datetime.now(timezone.utc)
+
+
+def _production_url(value: str) -> str:
+    return validate_mcp_url(value, allow_loopback=False)
+
+
+def _tool_scan_blocked() -> list[dict[str, str]]:
+    return [
+        _blocked(
+            "scan_required",
+            "owner has not supplied a successful current production MCP tool scan",
+        ),
+        _blocked(
+            "annotations_required",
+            "owner has not supplied live production evidence that every MCP tool sets readOnlyHint, openWorldHint, and destructiveHint",
+        ),
+        _blocked(
+            "justification_required",
+            "owner has not supplied a justification for each annotation value on every production MCP tool",
+        ),
+    ]
+
+
+def production_tool_scan_items(mcp_url: str | None, evidence: Any) -> list[dict[str, str]]:
+    """Return scan, annotation, and justification gates.
+
+    Missing evidence stays BLOCKED. Source text and repository tests are not
+    evidence. A supplied document is PASS only when it is a successful scan of
+    the same production MCP URL, every tool sets the three boolean hints, and
+    each hint has a justification.
+    """
+    if evidence is None:
+        return _tool_scan_blocked()
+    if not isinstance(evidence, dict):
+        reason = "tool scan evidence must be a JSON object supplied by the owner"
+        return [
+            _item("scan_required", "FAIL", reason, "submission"),
+            _item("annotations_required", "FAIL", reason, "submission"),
+            _item("justification_required", "FAIL", reason, "submission"),
+        ]
+    secrets: list[str] = []
+    _walk_secret_keys(evidence, secrets)
+    if secrets:
+        reason = "tool scan evidence contains secret-bearing fields"
+        return [
+            _item("scan_required", "FAIL", reason, "submission"),
+            _item("annotations_required", "FAIL", reason, "submission"),
+            _item("justification_required", "FAIL", reason, "submission"),
+        ]
+
+    supplied = (mcp_url or "").strip()
+    evidence_url = evidence.get("production_mcp_url")
+    url_ok = False
+    try:
+        if supplied and isinstance(evidence_url, str):
+            url_ok = _production_url(supplied) == _production_url(evidence_url)
+    except PackageError:
+        url_ok = False
+    tools = evidence.get("tools")
+    scan_ok = (
+        url_ok
+        and evidence.get("scan_status") == "success"
+        and _timestamp_ok(evidence.get("scanned_at"))
+        and isinstance(tools, list)
+    )
+    if scan_ok:
+        scan_item = _item(
+            "scan_required",
+            "PASS",
+            "owner supplied a successful tool scan of the supplied production MCP URL",
+            "submission",
+        )
+    else:
+        scan_item = _item(
+            "scan_required",
+            "FAIL",
+            "tool scan evidence is not a successful current scan of the supplied production MCP URL",
+            "submission",
+        )
+
+    annotation_failures: list[str] = []
+    justification_failures: list[str] = []
+    if not scan_ok:
+        annotation_failures.append(
+            "annotations are accepted only from a successful current production scan"
+        )
+        justification_failures.append(
+            "justifications are accepted only from a successful current production scan"
+        )
+    elif not isinstance(tools, list) or not tools:
+        annotation_failures.append("production scan did not list MCP tools")
+        justification_failures.append("production scan did not list MCP tools")
+    else:
+        for index, tool in enumerate(tools):
+            label = f"tools[{index}]"
+            if not isinstance(tool, dict) or not _nonempty(tool.get("name")):
+                annotation_failures.append(f"{label} is missing a name")
+                justification_failures.append(f"{label} is missing a name")
+                continue
+            label = str(tool["name"])
+            annotations = tool.get("annotations")
+            if not isinstance(annotations, dict):
+                annotation_failures.append(f"{label} is missing annotations")
+            else:
+                for hint in _ANNOTATION_HINTS:
+                    if not isinstance(annotations.get(hint), bool):
+                        annotation_failures.append(f"{label} {hint} must be a boolean")
+            justifications = tool.get("justifications")
+            if not isinstance(justifications, dict):
+                justification_failures.append(f"{label} is missing justifications")
+            else:
+                for hint in _ANNOTATION_HINTS:
+                    if not _nonempty(justifications.get(hint)):
+                        justification_failures.append(f"{label} {hint} justification is empty")
+
+    if scan_ok and not annotation_failures:
+        annotation_item = _item(
+            "annotations_required",
+            "PASS",
+            "every tool in the production scan sets readOnlyHint, openWorldHint, and destructiveHint",
+            "submission",
+        )
+    else:
+        annotation_item = _item(
+            "annotations_required",
+            "FAIL",
+            "; ".join(annotation_failures) or "production tool annotations are incomplete",
+            "submission",
+        )
+    if scan_ok and not annotation_failures and not justification_failures:
+        justification_item = _item(
+            "justification_required",
+            "PASS",
+            "every production tool annotation has a justification",
+            "submission",
+        )
+    else:
+        justification_item = _item(
+            "justification_required",
+            "FAIL",
+            "; ".join(justification_failures)
+            or "justifications require complete production tool annotations",
+            "submission",
+        )
+    return [scan_item, annotation_item, justification_item]
 
 
 def metadata_passthrough_evidence(root: Path) -> tuple[bool, str]:
@@ -303,7 +465,13 @@ def _finalize(mode: str, items: list[dict[str, str]], dev_loopback: bool) -> dic
     }
 
 
-def evaluate(root: Path | None = None, *, mode: str, mcp_url: str | None = None) -> dict[str, Any]:
+def evaluate(
+    root: Path | None = None,
+    *,
+    mode: str,
+    mcp_url: str | None = None,
+    tool_scan_evidence: Any = None,
+) -> dict[str, Any]:
     """Return a readiness report. mode is ``local`` or ``submission``."""
     if mode not in {"local", "submission"}:
         raise PackageError("mode must be local or submission")
@@ -488,6 +656,7 @@ def evaluate(root: Path | None = None, *, mode: str, mcp_url: str | None = None)
             "repository",
         )
     )
+    items.extend(production_tool_scan_items(supplied, tool_scan_evidence))
 
     try:
         cases_ok = _review_cases_ok(_load_json(cases_path))

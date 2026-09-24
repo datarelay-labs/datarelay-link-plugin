@@ -33,7 +33,8 @@ Repository contract for this phase:
 7. This repository does not create DNS, activate a live challenge token, or submit the plugin. It ships no skills and no custom UI.
 8. Remote MCP final submission requires a demo-recording URL. `demo_recording_url` stays BLOCKED. This repository does not invent a URL or a recording.
 9. Reviewer fixtures are exactly five positive cases and three negative cases. Six positive or four negative cases fail the readiness check.
-10. `tool_metadata_passthrough` PASS means `RelayTestCase.test_tools_metadata_passthrough_is_unmodified` passed. The checker does not scan source text for annotation names.
+10. `tool_metadata_passthrough` PASS means `RelayTestCase.test_tools_metadata_passthrough_is_unmodified` passed. The checker does not scan source text for annotation names. That result is repository behavioral evidence only.
+11. Final MCP submission errors `scan_required`, `annotations_required`, and `justification_required` are separate submission gates. They stay BLOCKED until the owner supplies a tool-scan JSON document. PASS requires `scan_status=success`, a timezone-aware `scanned_at` that is not in the future, the same production MCP URL passed to the checker, a non-empty `tools` list, boolean `readOnlyHint`, `openWorldHint`, and `destructiveHint` on every tool, and a non-empty justification for each of those hints. The checker does not contact the production server and does not treat unit tests or source text as a scan.
 
 ## MCP wire behavior
 

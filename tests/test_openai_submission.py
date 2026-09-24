@@ -25,6 +25,42 @@ from tests.test_relay_poc import ROOT, _free_port
 _OWNER = "owner-approval-secret-32chars!!"
 
 
+def _tool_scan_evidence(url: str) -> dict:
+    return {
+        "production_mcp_url": url,
+        "scan_status": "success",
+        "scanned_at": "2026-01-15T00:00:00Z",
+        "tools": [
+            {
+                "name": "read_file",
+                "annotations": {
+                    "readOnlyHint": True,
+                    "openWorldHint": False,
+                    "destructiveHint": False,
+                },
+                "justifications": {
+                    "readOnlyHint": "Reads one authorized file and does not change host state.",
+                    "openWorldHint": "The tool reaches only the connected DataRelay Link server.",
+                    "destructiveHint": "The tool does not delete or overwrite host data.",
+                },
+            },
+            {
+                "name": "write_file",
+                "annotations": {
+                    "readOnlyHint": False,
+                    "openWorldHint": False,
+                    "destructiveHint": True,
+                },
+                "justifications": {
+                    "readOnlyHint": "Writes host file content when upstream AI Access allows it.",
+                    "openWorldHint": "The tool reaches only the connected DataRelay Link server.",
+                    "destructiveHint": "A write can overwrite an authorized host file.",
+                },
+            },
+        ],
+    }
+
+
 def _oauth_env(port: int, *, challenge: str | None = None) -> dict[str, str]:
     env = {
         "DRLINK_RELAY_AUTH_MODE": "oauth",
@@ -206,8 +242,15 @@ class PackageContractTests(unittest.TestCase):
             "publisher_identity",
             "country_availability",
             "openai_submission",
+            "scan_required",
+            "annotations_required",
+            "justification_required",
         ):
             self.assertEqual(by_id[blocked], "BLOCKED", blocked)
+        for gate in ("scan_required", "annotations_required", "justification_required"):
+            reason = next(item["reason"] for item in report["items"] if item["id"] == gate)
+            self.assertIn("owner", reason)
+            self.assertNotIn("test_tools_metadata_passthrough", reason)
 
     def test_submission_mode_blocks_owner_inputs_and_requires_https(self) -> None:
         missing = evaluate(mode="submission")
@@ -251,6 +294,102 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("MFA", next(item["reason"] for item in supplied["items"] if item["id"] == "reviewer_credentials"))
         self.assertEqual(supplied["overall_status"], "BLOCKED")
         self.assertFalse(supplied["submission_ready"])
+        self.assertEqual(supplied_ids["scan_required"], "BLOCKED")
+        self.assertEqual(supplied_ids["annotations_required"], "BLOCKED")
+        self.assertEqual(supplied_ids["justification_required"], "BLOCKED")
+        self.assertEqual(supplied_ids["tool_metadata_passthrough"], "PASS")
+
+    def test_live_tool_scan_gates_block_submission_until_owner_evidence(self) -> None:
+        report = evaluate(mode="submission", mcp_url="https://mcp.example.com/mcp")
+        self._assert_not_submission_ready(report)
+        self.assertTrue(report["repository_checks_ok"], report)
+        by_id = {item["id"]: item for item in report["items"]}
+        for gate in ("scan_required", "annotations_required", "justification_required"):
+            self.assertEqual(by_id[gate]["status"], "BLOCKED", gate)
+            self.assertEqual(by_id[gate]["scope"], "submission")
+        self.assertEqual(by_id["tool_metadata_passthrough"]["status"], "PASS")
+        self.assertIn(
+            "test_tools_metadata_passthrough_is_unmodified",
+            by_id["tool_metadata_passthrough"]["reason"],
+        )
+
+    def test_owner_tool_scan_evidence_passes_gates_without_submission_ready(self) -> None:
+        url = "https://mcp.example.com/mcp"
+        evidence = _tool_scan_evidence(url)
+        report = evaluate(mode="submission", mcp_url=url, tool_scan_evidence=evidence)
+        self._assert_not_submission_ready(report)
+        self.assertTrue(report["repository_checks_ok"], report)
+        by_id = {item["id"]: item["status"] for item in report["items"]}
+        self.assertEqual(by_id["scan_required"], "PASS")
+        self.assertEqual(by_id["annotations_required"], "PASS")
+        self.assertEqual(by_id["justification_required"], "PASS")
+        self.assertEqual(by_id["reviewer_credentials"], "BLOCKED")
+        self.assertEqual(report["overall_status"], "BLOCKED")
+        self.assertFalse(report["submission_ready"])
+
+        mismatched = evaluate(
+            mode="submission",
+            mcp_url=url,
+            tool_scan_evidence=_tool_scan_evidence("https://other.example.com/mcp"),
+        )
+        mismatched_ids = {item["id"]: item["status"] for item in mismatched["items"]}
+        self.assertEqual(mismatched_ids["scan_required"], "FAIL")
+        self.assertEqual(mismatched_ids["annotations_required"], "FAIL")
+        self.assertEqual(mismatched_ids["justification_required"], "FAIL")
+        self.assertEqual(mismatched["overall_status"], "FAIL")
+        self.assertFalse(mismatched["submission_ready"])
+
+        incomplete = _tool_scan_evidence(url)
+        incomplete["tools"][0]["annotations"].pop("openWorldHint")
+        incomplete["tools"][1]["justifications"]["destructiveHint"] = " "
+        partial = evaluate(mode="submission", mcp_url=url, tool_scan_evidence=incomplete)
+        partial_ids = {item["id"]: item["status"] for item in partial["items"]}
+        self.assertEqual(partial_ids["scan_required"], "PASS")
+        self.assertEqual(partial_ids["annotations_required"], "FAIL")
+        self.assertEqual(partial_ids["justification_required"], "FAIL")
+        self.assertFalse(partial["submission_ready"])
+
+        stringly = _tool_scan_evidence(url)
+        stringly["tools"][0]["annotations"]["readOnlyHint"] = "true"
+        stringly_report = evaluate(mode="submission", mcp_url=url, tool_scan_evidence=stringly)
+        stringly_ids = {item["id"]: item["status"] for item in stringly_report["items"]}
+        self.assertEqual(stringly_ids["annotations_required"], "FAIL")
+        self.assertFalse(stringly_report["submission_ready"])
+
+        secretive = _tool_scan_evidence(url)
+        secretive["access_token"] = "upstream-secret"
+        secret_report = evaluate(mode="submission", mcp_url=url, tool_scan_evidence=secretive)
+        secret_ids = {item["id"]: item["status"] for item in secret_report["items"]}
+        self.assertEqual(secret_ids["scan_required"], "FAIL")
+        self.assertFalse(secret_report["submission_ready"])
+
+        empty = _tool_scan_evidence(url)
+        empty["tools"] = []
+        empty_report = evaluate(mode="submission", mcp_url=url, tool_scan_evidence=empty)
+        empty_ids = {item["id"]: item["status"] for item in empty_report["items"]}
+        self.assertEqual(empty_ids["scan_required"], "PASS")
+        self.assertEqual(empty_ids["annotations_required"], "FAIL")
+        self.assertEqual(empty_ids["justification_required"], "FAIL")
+        self.assertFalse(empty_report["submission_ready"])
+
+    def test_cli_rejects_unreadable_tool_scan_evidence(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "scripts/submission-readiness.py",
+                "--mode",
+                "local",
+                "--tool-scan-evidence",
+                str(ROOT / "docs" / "submission" / "missing-tool-scan.json"),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertIn("tool scan evidence", completed.stderr)
+        self.assertFalse((ROOT / "docs" / "submission" / "missing-tool-scan.json").exists())
 
     def test_review_cases_have_five_positive_and_three_negative(self) -> None:
         cases = json.loads(

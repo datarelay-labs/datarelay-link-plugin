@@ -122,7 +122,11 @@ Repository-controlled checks can pass while owner and platform gates stay
 BLOCKED. The process exits 0 only when `submission_ready` is true. A missing
 production MCP URL is BLOCKED. A supplied URL fails when it is not public HTTPS
 `/mcp` without a query, fragment, credential, or private literal address.
-Hostname reachability is not probed.
+Hostname reachability is not probed. `tool_metadata_passthrough` only records
+that the relay leaves upstream tool metadata unchanged. `scan_required`,
+`annotations_required`, and `justification_required` stay BLOCKED until the
+owner passes `--tool-scan-evidence` for a successful current production scan.
+That file is not committed here.
 `overall_status` stays BLOCKED while any submission prerequisite is BLOCKED.
 Domain verification, when a portal token is provided at runtime only, is
 `GET /.well-known/openai-apps-challenge`

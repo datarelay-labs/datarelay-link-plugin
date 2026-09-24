@@ -25,7 +25,9 @@ See [docs/architecture.md](docs/architecture.md) and [docs/openai-plugin-assumpt
 
 | Path | Purpose |
 | --- | --- |
-| `plugin.json` / `mcp.json` | Portable Agent Plugins package (Remote MCP-only) |
+| `.codex-plugin/plugin.json` | OpenAI install-surface manifest (top-level `interface` only) |
+| `plugin.json` / `mcp.json` | Portable Agent Plugins manifests. `mcp.json` is the documented streamable-http declaration |
+| `docs/submission/review-cases.json` | 5 positive and 3 negative reviewer fixtures |
 | `relay/` | Streamable HTTP MCP relay. Mock mode is single-upstream; OAuth mode binds each Plugin subject to explicitly connected DRLink servers. |
 | `schemas/` | Vendored Agent Plugins JSON Schemas for local validation |
 | `docs/` | Architecture, auth seam, verified OpenAI assumptions |
@@ -104,8 +106,27 @@ The default mock token is loopback-only. Non-loopback bind should use `oauth`
 mode. Legacy mock-on-public requires both `DRLINK_RELAY_ALLOW_NON_LOOPBACK_BIND=1`
 and an explicit non-default `DRLINK_RELAY_MOCK_PLUGIN_TOKEN`.
 
-`mcp.json` points at the local PoC relay URL. Production HTTPS (`mcp.datarelay.run`)
-and Plugin Directory submission remain out of scope.
+`mcp.json` points at the local PoC relay URL. There is no `.mcp.json` and no
+`.app.json`: current docs do not show remote streamable-http inside `.mcp.json`,
+and `.app.json` is valid only after ChatGPT developer mode returns a real
+`plugin_asdk_app` id. Production HTTPS and Plugin Directory submission are not
+performed from this repository. Check readiness without contacting OpenAI:
+
+```bash
+python3 scripts/submission-readiness.py --mode local
+python3 scripts/submission-readiness.py --mode submission
+python3 scripts/submission-readiness.py --mode submission --mcp-url https://mcp.example/mcp
+```
+
+Repository-controlled checks can pass while owner and platform gates stay
+BLOCKED. The process exits 0 only when `submission_ready` is true. A missing
+production MCP URL is BLOCKED. A supplied URL fails when it is not public HTTPS
+`/mcp` without a query, fragment, credential, or private literal address.
+Hostname reachability is not probed.
+`overall_status` stays BLOCKED while any submission prerequisite is BLOCKED.
+Domain verification, when a portal token is provided at runtime only, is
+`GET /.well-known/openai-apps-challenge`
+(`DRLINK_RELAY_OPENAI_APPS_CHALLENGE`). No token is committed.
 
 ## Tests
 

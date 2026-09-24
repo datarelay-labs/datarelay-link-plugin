@@ -123,16 +123,16 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
             )
             return
         if method == "tools/call":
+            result: dict[str, Any] = {
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": {"echo": payload.get("params")},
+            }
+            extra = getattr(self.server, "call_result_extra", None)
+            if isinstance(extra, dict):
+                result.update(extra)
             self._json(
                 200,
-                {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "content": [{"type": "text", "text": "ok"}],
-                        "structuredContent": {"echo": payload.get("params")},
-                    },
-                },
+                {"jsonrpc": "2.0", "id": req_id, "result": result},
             )
             return
         if method == "boom":
@@ -253,6 +253,77 @@ class RelayTestCase(unittest.TestCase):
         self.assertEqual(len(tools), 2)
         self.assertEqual(tools[0]["annotations"]["readOnlyHint"], True)
         self.assertEqual(tools[1]["securitySchemes"][0]["scopes"], ["host.write"])
+
+    def test_tools_metadata_passthrough_is_unmodified(self) -> None:
+        read_tool = {
+            "name": "read_file",
+            "title": "Read file",
+            "description": "Read an authorized host file",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {"content": {"type": "string"}},
+            },
+            "annotations": {
+                "readOnlyHint": True,
+                "openWorldHint": False,
+                "destructiveHint": False,
+            },
+            "securitySchemes": [{"type": "oauth2", "scopes": ["host.read"]}],
+            "_meta": {"openai/toolInvocation/invoking": "Reading"},
+        }
+        write_tool = {
+            "name": "write_file",
+            "title": "Write file",
+            "description": "Write an authorized host file",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+            "outputSchema": {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+            "annotations": {
+                "readOnlyHint": False,
+                "openWorldHint": False,
+                "destructiveHint": True,
+            },
+            "securitySchemes": [{"type": "oauth2", "scopes": ["host.write"]}],
+            "_meta": {"source": "upstream-drlink"},
+        }
+        self.upstream.tools = [read_tool, write_tool]
+        status, _, body = self._mcp(
+            {"jsonrpc": "2.0", "id": 11, "method": "tools/list", "params": {}}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["result"]["tools"], [read_tool, write_tool])
+
+        challenge = 'Bearer realm="upstream", error="invalid_token"'
+        self.upstream.call_result_extra = {
+            "_meta": {"mcp/www_authenticate": [challenge]},
+            "isError": True,
+        }
+        status, _, called = self._mcp(
+            {
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {"path": "/tmp/x"}},
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(called["result"]["_meta"], {"mcp/www_authenticate": [challenge]})
+        self.assertTrue(called["result"]["isError"])
+        self.assertEqual(
+            called["result"]["structuredContent"]["echo"]["name"],
+            "read_file",
+        )
 
     def test_tools_call_passthrough(self) -> None:
         status, _, body = self._mcp(

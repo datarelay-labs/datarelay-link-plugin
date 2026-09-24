@@ -37,6 +37,7 @@ class RelayConfig:
     allow_non_loopback_bind: bool
     oauth_state_path: str | None
     oauth_allow_ephemeral: bool
+    openai_apps_challenge: str | None
 
 
 _BLOCKED_HOSTNAMES = {"metadata.google.internal", "metadata"}
@@ -310,6 +311,20 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
     # OAuth mode must never silently accept mock bearer tokens.
     # Mock mode remains available for loopback/local tests (and Packet 1 override).
 
+    challenge_raw = env.get("DRLINK_RELAY_OPENAI_APPS_CHALLENGE")
+    openai_apps_challenge: str | None = None
+    if challenge_raw is not None:
+        if (
+            not challenge_raw
+            or challenge_raw != challenge_raw.strip()
+            or any(ch.isspace() for ch in challenge_raw)
+            or len(challenge_raw) > 256
+        ):
+            raise ConfigError(
+                "DRLINK_RELAY_OPENAI_APPS_CHALLENGE must be one token with no whitespace"
+            )
+        openai_apps_challenge = challenge_raw
+
     return RelayConfig(
         bind_host=bind_host,
         bind_port=bind_port,
@@ -326,4 +341,5 @@ def load_config(environ: dict[str, str] | None = None) -> RelayConfig:
         allow_non_loopback_bind=allow_non_loopback_bind,
         oauth_state_path=oauth_state_path,
         oauth_allow_ephemeral=oauth_allow_ephemeral,
+        openai_apps_challenge=openai_apps_challenge,
     )

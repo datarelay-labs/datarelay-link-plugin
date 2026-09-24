@@ -2,7 +2,7 @@
 
 ```
 ChatGPT Plus
-  -> DataRelay Link Plugin (this repo: plugin.json / mcp.json)
+  -> DataRelay Link Plugin (this repo: .codex-plugin/plugin.json and root mcp.json)
   -> shared public DataRelay MCP relay (PoC: local relay; future: mcp.datarelay.run)
   -> bound customer DRLink Server (upstream MCP)
   -> DRLink AI Identity / AI Access

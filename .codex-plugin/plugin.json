@@ -1,0 +1,24 @@
+{
+  "name": "datarelay-link",
+  "version": "0.1.0",
+  "description": "Secure access to authorized private hosts through DataRelay Link.",
+  "author": {
+    "name": "DataRelay Labs",
+    "url": "https://datarelay.run"
+  },
+  "license": "Data Relay Source Available License 1.0",
+  "interface": {
+    "displayName": "DataRelay Link",
+    "shortDescription": "Secure access to authorized private hosts through DataRelay Link.",
+    "longDescription": "Connect ChatGPT to hosts authorized by your DataRelay Link Server. The plugin talks to a DataRelay MCP relay. DRLink Server remains the final authorization source of truth on every tool call.",
+    "developerName": "DataRelay Labs",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://datarelay.run",
+    "defaultPrompt": [
+      "List the tools my connected DataRelay Link server advertises, then use only a tool my DRLink AI Access policy allows.",
+      "Read a file on an authorized host if DataRelay Link AI Access allows it.",
+      "Write a file on an authorized host only when DataRelay Link AI Access allows that change."
+    ]
+  }
+}

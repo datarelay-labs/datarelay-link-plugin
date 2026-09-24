@@ -126,6 +126,9 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         if path == "/.well-known/oauth-authorization-server":
             self._handle_authorization_server_metadata()
             return
+        if path == "/.well-known/openai-apps-challenge":
+            self._handle_openai_apps_challenge()
+            return
         if path == "/oauth/authorize":
             self._handle_authorize_get(parse_qs(parsed.query))
             return
@@ -170,6 +173,20 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             self._handle_mcp("DELETE")
             return
         self._send_json(404, {"error": "not_found"})
+
+    def _handle_openai_apps_challenge(self) -> None:
+        """Serve the portal token only when runtime config provides exactly one."""
+        token = self.server.relay_config.openai_apps_challenge
+        if not token:
+            self._send_json(404, {"error": "not_found"})
+            return
+        audit_event(self.server.audit_logger, "openai_apps_challenge_served")
+        body = token.encode("utf-8")
+        self._send_bytes(
+            200,
+            body,
+            [("Content-Type", "text/plain; charset=utf-8")],
+        )
 
     def _handle_health(self) -> None:
         # Never expose upstream URL, tokens, or binding secrets.

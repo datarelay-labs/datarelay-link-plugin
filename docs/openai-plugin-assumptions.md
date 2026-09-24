@@ -10,17 +10,26 @@ Sources consulted (official only):
 - [MCP Authorization (2025-11-25)](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
 - [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports)
 
-Recorded: 2026-09-22 (Packet 2 OAuth re-check).
+Recorded: 2026-09-24 from the official Package your plugin page.
 
 ## Packaging
 
-1. **Portable Agent Plugins** is the current packaging floor: root `plugin.json` + optional `mcp.json` + optional `skills/`.
-2. Do **not** assume legacy ChatGPT Plugin format (`ai-plugin.json` + OpenAPI) unless a future official doc requires it. Current docs use Agent Plugins / Apps SDK MCP.
-3. OpenAI-specific install-surface metadata lives under `extensions.com.openai` in root `plugin.json` (or legacy `.codex-plugin/plugin.json` as fallback).
-4. Remote MCP servers are declared in root `mcp.json` with `type: "streamable-http"` and an absolute `url`.
-5. Literal credentials must **not** appear in `mcp.json` headers; OAuth / credential storage is client-managed in Agent Plugins v1.
-6. Public submission requires a stable public **HTTPS** MCP endpoint (typically ending in `/mcp`). Local/dev may use loopback HTTP for PoC only.
-7. Custom UI / skills are optional for Remote MCP-only plugins. This repo ships no skills and no custom UI.
+Fetched page behavior:
+
+1. The portable package entry is root `plugin.json` plus optional root `mcp.json`. OpenAI install-surface metadata may live in `extensions.com.openai.interface`, including `defaultPrompt`.
+2. `.codex-plugin/plugin.json` is the plugin-creator compatibility overlay. It supplies OpenAI settings only when root `plugin.json` has no `extensions.com.openai` object. When that object is present, it replaces the overlay entirely; the two are not merged.
+3. The scaffold can also emit root `.mcp.json` and `.app.json`. `.app.json` maps a portal-registered `plugin_asdk_app` id. Portable `mcp.json` must declare a transport `type`. Renaming `.mcp.json` to `mcp.json` without `type` drops the transport.
+4. Public submission uses one Universal public HTTPS MCP URL. This product does not use a template URL.
+
+Repository contract for this phase:
+
+1. OpenAI install-surface metadata is `.codex-plugin/plugin.json` with documented top-level `interface` fields. Root `plugin.json` omits `extensions` so that overlay stays active.
+2. The overlay does not set `apps` or `mcpServers`. Current docs use `apps` for a real `.app.json` mapping created only after ChatGPT developer mode registers an MCP connection and returns a `plugin_asdk_app` id. This repository does not invent that id, and it does not commit `.app.json`.
+3. Current docs do not show a remote `streamable-http` object inside `.mcp.json`. That file is omitted. Portable remote MCP, including transport `type`, is root `mcp.json`. The committed URL is the local PoC (`http://127.0.0.1:8741/mcp`).
+4. A production URL is an input to `scripts/submission-readiness.py`. Missing owner input is BLOCKED. An explicitly supplied URL is FAIL when it is not HTTPS, not exactly `/mcp`, has a query or fragment, embeds credentials, or uses a loopback, private, link-local, metadata, or reserved literal address. The checker does not probe DNS. Hostname reachability stays BLOCKED.
+5. `package_layout` is PASS only when that registered app mapping is actually wired. Until then it stays OWNER/PLATFORM BLOCKED. `repository_checks_ok` can still be true. `submission_ready` stays false, and `overall_status` stays BLOCKED, while any submission prerequisite is BLOCKED.
+6. `privacyPolicyURL` and `termsOfServiceURL` are omitted until the owner approves public legal pages.
+7. This repository does not create DNS, activate a live challenge token, or submit the plugin. It ships no skills and no custom UI.
 
 ## MCP wire behavior
 
@@ -44,4 +53,4 @@ Recorded: 2026-09-22 (Packet 2 OAuth re-check).
 
 1. This repository publishes the ChatGPT Plus-facing Plugin package and a public relay seam.
 2. Upstream DRLink Server remains the authorization source of truth on every `tools/call`.
-3. Package URL remains a configurable local/dev or deploy-time HTTPS endpoint; production `mcp.datarelay.run` and Plugin Directory submission are out of scope.
+3. The committed package URL is the local PoC. Production HTTPS and Plugin Directory submission stay owner-gated. `scripts/submission-readiness.py` reports those gates as BLOCKED until the owner supplies them.

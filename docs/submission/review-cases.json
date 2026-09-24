@@ -1,0 +1,70 @@
+{
+  "starter_prompts_present": true,
+  "authority": "DRLink AI Identity and AI Access remain the final per-call authorization authority. The relay must not rewrite a DENY into success or invent tools.",
+  "reviewer_network": "These fixtures do not require a private production network. A public reviewer account and endpoint remain owner-gated. No login, password, or live challenge token is stored here.",
+  "positive": [
+    {
+      "id": "P1",
+      "title": "Discover advertised tools after connect",
+      "user_prompt": "List the tools my connected DataRelay Link server advertises.",
+      "expected_behavior": "The plugin calls tools/list on the connected upstream and returns that server's tools without renaming them or rewriting descriptions, schemas, securitySchemes, _meta, or annotations.",
+      "expected_result_shape": "JSON-RPC result.tools is the upstream array. Each tool keeps its name, description, inputSchema, outputSchema when present, annotations, securitySchemes, and _meta.",
+      "fixture_data": "Local mock upstream advertises read_file and write_file. No reviewer account is included; a public reviewer login remains owner-gated."
+    },
+    {
+      "id": "P2",
+      "title": "Read an allowed file",
+      "user_prompt": "Read a file on a host my connected DataRelay Link server already authorizes.",
+      "expected_behavior": "The relay forwards tools/call unchanged. The read succeeds only when upstream DRLink AI Access allows it.",
+      "expected_result_shape": "JSON-RPC tools/call result from upstream, including its content or structuredContent. The relay does not add a success the upstream did not return.",
+      "fixture_data": "Local mock tool name read_file. The file path must be one the connected DRLink policy allows. No production path or credential is stored in this fixture."
+    },
+    {
+      "id": "P3",
+      "title": "Write an allowed file",
+      "user_prompt": "Write a file on an authorized host only when DataRelay Link AI Access allows that change.",
+      "expected_behavior": "The relay forwards the write tools/call. A write succeeds only when upstream DRLink AI Access allows it. destructiveHint stays the value the upstream tool advertised.",
+      "expected_result_shape": "JSON-RPC tools/call result from upstream. A denied write stays an upstream error or denial result, not a relay-invented success.",
+      "fixture_data": "Local mock tool name write_file. Content and path must already be allowed by the connected server policy. No production credential is stored here."
+    },
+    {
+      "id": "P4",
+      "title": "Safety annotations stay upstream-owned",
+      "user_prompt": "Show readOnlyHint, openWorldHint, and destructiveHint for the tools my connected server advertises.",
+      "expected_behavior": "The relay does not invent or rewrite annotations. A read-only tool stays read-only, and a destructive tool stays destructive, exactly as upstream sent them.",
+      "expected_result_shape": "tools/list annotations objects are byte-for-value identical to the upstream tools, including readOnlyHint, openWorldHint, and destructiveHint.",
+      "fixture_data": "Local mock read_file is read-only and non-destructive. Local mock write_file is destructive. Live DRLink tool names stay upstream-owned."
+    },
+    {
+      "id": "P5",
+      "title": "Reconnect and repeat an allowed read",
+      "user_prompt": "Reconnect my plugin session, then read an authorized file again on the same connected DataRelay Link server.",
+      "expected_behavior": "Refresh keeps the same plugin subject binding. The repeated tools/call is still decided only by upstream DRLink AI Access.",
+      "expected_result_shape": "After refresh, tools/call returns the upstream result for the same allowed read. The relay does not substitute another subject's server.",
+      "fixture_data": "Same local read_file fixture as an allowed read. Reviewer OAuth refresh uses the owner-gated public account, which is not stored in this repository."
+    }
+  ],
+  "negative": [
+    {
+      "id": "N1",
+      "title": "Upstream AI Access denial",
+      "user_prompt": "Read a file that my connected DataRelay Link server denies.",
+      "expected_fallback": "The relay returns the upstream denial unchanged and does not describe the read as successful.",
+      "why_not_complete": "DRLink AI Access is the final authority. Completing the read would rewrite a DENY into success."
+    },
+    {
+      "id": "N2",
+      "title": "Missing plugin authentication",
+      "scenario": "Send tools/list or tools/call with no plugin bearer token.",
+      "expected_fallback": "The relay returns only its own authentication challenge and does not dial the upstream DRLink server.",
+      "why_not_complete": "An unauthenticated plugin request must fail closed. Inventing tool results or annotations would bypass the relay auth seam."
+    },
+    {
+      "id": "N3",
+      "title": "Unbound or other subject's server",
+      "user_prompt": "Use a DataRelay Link server this plugin subject has not connected, or another subject's binding.",
+      "expected_fallback": "The relay denies the request and does not fall back to a global upstream or to another tenant's server.",
+      "why_not_complete": "The plugin subject has no connected server for that host. Completing the call would cross tenants or open a proxy."
+    }
+  ]
+}

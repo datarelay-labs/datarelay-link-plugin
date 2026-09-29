@@ -19,3 +19,4 @@ blockers:
   p0: true
   p1: true
   user_blocking_p2: true
+execution_context: github-hosted

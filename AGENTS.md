@@ -20,6 +20,7 @@ When explicitly resuming an existing workstream, resolve this repository first a
 
 ## Execution rules
 
+- **Execute useful work continuously.** Implement in coherent small/medium batches, validate locally with the cheapest relevant tests, and keep going while a safe authorized next action exists. Use fast CI for quick integration feedback when useful; reserve full qualification/release CI for a stable candidate. If waiting on an external condition, work on the highest-priority independent roadmap item instead of polling. Stop only for a real owner decision/credential, an irreconcilable blocker, a status-only request, or a completed bounded outcome.
 1. Classify the change and identify affected domains/contracts/security/operations.
 2. For material design-bearing changes, apply the canonical `standards/DESIGN.md` minimal design gate before implementation.
 3. Inspect relevant implementation and tests.

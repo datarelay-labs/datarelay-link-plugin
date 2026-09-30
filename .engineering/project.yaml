@@ -1,7 +1,7 @@
 engineering_system:
   version: 1.6.5
   mode: adopted
-  baseline: 6a80c09cb66230d9a63660a1d3e5abd401bf8a14
+  baseline: 5cad7fbf20be8e8041e7e67312465c7ce19600e8
   ci_mode: shared
   native_ci_workflows: []
   merge_gate_status: advisory

@@ -1,11 +1,11 @@
 engineering_system:
   version: 1.7.0
   mode: adopted
-  baseline: 99b5f10ed895c041fdff165c1200bc2ab51444fd
+  baseline: 6b7dda4b75e62a4dbc9ac7587a6723ee25f19163
   ci_mode: shared
   native_ci_workflows: []
   merge_gate_status: advisory
-  policy_epoch: 1
+  policy_epoch: 2
 project:
   name: datarelay-link-plugin
   type: python

@@ -42,3 +42,7 @@ human_equivalent_user_tests:
     mandatory: true
     contract: docs/ENGINEERING_FULL_USER_E2E.md
     minimum_passes: 1
+  canonical_contract_read_before_execution_required: true
+  complete_rerun_after_remediation_required: true
+  wrapper_user_substitution_forbidden: true
+  contract_review_attestation_version: 1

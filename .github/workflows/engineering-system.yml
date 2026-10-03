@@ -10,22 +10,22 @@ permissions:
 jobs:
   governance-floor:
     if: github.event_name == 'pull_request_target'
-    uses: datarelay-labs/engineering-system/.github/workflows/governance-floor.yml@04ea5080440371e895d9a57570ba70e6a3318781
+    uses: datarelay-labs/engineering-system/.github/workflows/governance-floor.yml@7d7c83aeb3cd7766bc224e8496a283f5af87edd5
     with:
       base_sha: ${{ github.event.pull_request.base.sha }}
       head_sha: ${{ github.event.pull_request.head.sha }}
 
   adoption-compliance:
     if: github.event_name == 'pull_request'
-    uses: datarelay-labs/engineering-system/.github/workflows/adoption-compliance.yml@04ea5080440371e895d9a57570ba70e6a3318781
+    uses: datarelay-labs/engineering-system/.github/workflows/adoption-compliance.yml@7d7c83aeb3cd7766bc224e8496a283f5af87edd5
 
   enforcement-reconcile:
     if: github.event_name == 'pull_request'
-    uses: datarelay-labs/engineering-system/.github/workflows/enforcement-check.yml@04ea5080440371e895d9a57570ba70e6a3318781
+    uses: datarelay-labs/engineering-system/.github/workflows/enforcement-check.yml@7d7c83aeb3cd7766bc224e8496a283f5af87edd5
 
   affected-tests:
     if: github.event_name == 'pull_request'
-    uses: datarelay-labs/engineering-system/.github/workflows/affected-tests.yml@04ea5080440371e895d9a57570ba70e6a3318781
+    uses: datarelay-labs/engineering-system/.github/workflows/affected-tests.yml@7d7c83aeb3cd7766bc224e8496a283f5af87edd5
     with:
       manifest_path: .engineering/tests.yaml
       trigger: pr

@@ -20,3 +20,25 @@ blockers:
   p1: true
   user_blocking_p2: true
 execution_context: github-hosted
+human_equivalent_user_tests_required: true
+human_equivalent_user_tests:
+  contract_version: 2
+  executor: EXECUTION_PROFILE
+  direct_persona_execution_required: true
+  actual_user_surface_required: true
+  primary_user_surface: other
+  actual_browser_process_required: false
+  same_candidate_required: true
+  finding_accumulation_before_remediation: true
+  same_head_quality_closure_required: true
+  candidate_freeze_after_quality_closure: true
+  ci_contract_validation_only: true
+  evidence_validator: tools/user_acceptance_contract.py
+  surface_reconciliation:
+    mandatory: true
+    contract: docs/ENGINEERING_SURFACE_RECONCILIATION.md
+    minimum_passes: 1
+  full_user_e2e:
+    mandatory: true
+    contract: docs/ENGINEERING_FULL_USER_E2E.md
+    minimum_passes: 1

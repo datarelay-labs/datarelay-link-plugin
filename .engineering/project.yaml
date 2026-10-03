@@ -8,8 +8,10 @@ engineering_system:
   policy_epoch: 9
 project:
   name: datarelay-link-plugin
-  type: python
+  type: integration
   maturity: experimental
+  user_facing: true
+  primary_user_surface: other
 domains:
 - core
 platforms:

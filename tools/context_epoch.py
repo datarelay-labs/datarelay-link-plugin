@@ -11,11 +11,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from execution_profile import ProfileError, load_profile, packet_authority
-
-META_RE = re.compile(r"^([A-Z][A-Z0-9_]+)=(.*)$")
-HEADING_RE = re.compile(r"^##\s+(.+?)\s*$")
-FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+from execution_profile import (
+    FENCE_RE,
+    HEADING_RE,
+    META_RE,
+    ProfileError,
+    load_profile,
+    packet_authority,
+    scan_packet_metadata,
+)
 ALLOWED_STATUSES = {"ACTIVE", "PAUSED", "BLOCKED", "COMPLETE"}
 SAFE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SAFE_WORKSTREAM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -93,13 +97,11 @@ def _read_text(path: str) -> str:
 
 
 def parse_packet(text: str) -> Packet:
-    metadata: dict[str, str] = {}
+    metadata, duplicate_metadata = scan_packet_metadata(text)
     sections: dict[str, list[str]] = {}
-    duplicate_metadata: list[str] = []
     duplicates: list[str] = []
     headings: list[str] = []
     current: str | None = None
-    before_heading = True
     fence: tuple[str, int] | None = None
     for raw in text.splitlines():
         fence_match = FENCE_RE.match(raw)
@@ -120,21 +122,12 @@ def parse_packet(text: str) -> Packet:
             continue
         heading = HEADING_RE.match(raw)
         if heading:
-            before_heading = False
             current = heading.group(1).strip()
             headings.append(current)
             if current in sections:
                 duplicates.append(current)
             sections.setdefault(current, [])
             continue
-        if before_heading:
-            match = META_RE.match(raw)
-            if match:
-                key = match.group(1)
-                if key in metadata:
-                    duplicate_metadata.append(key)
-                else:
-                    metadata[key] = match.group(2).strip()
         if current is not None:
             sections[current].append(raw)
     rendered = {name: "\n".join(lines).strip() for name, lines in sections.items()}
@@ -153,6 +146,7 @@ def parse_packet(text: str) -> Packet:
 def analyze_packet(
     packet: Packet,
     *,
+    profile_root: Path | str | None = None,
     warn_chars: int | None = None,
     warn_lines: int | None = None,
 ) -> dict[str, Any]:
@@ -194,8 +188,13 @@ def analyze_packet(
     change_risk = packet.metadata.get("CHANGE_RISK")
     if change_risk and change_risk not in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
         blocking.append("CHANGE_RISK_INVALID")
+    root = (
+        Path(profile_root)
+        if profile_root is not None
+        else Path(__file__).resolve().parents[1]
+    )
     try:
-        execution_profile = load_profile(Path.cwd())
+        execution_profile = load_profile(root)
     except ProfileError:
         blocking.append("EXECUTION_PROFILE_UNAVAILABLE")
     else:
@@ -536,6 +535,7 @@ def main() -> int:
 
     lint = sub.add_parser("packet-lint")
     lint.add_argument("--body-file", required=True)
+    lint.add_argument("--root")
     lint.add_argument("--warn-chars", type=int)
     lint.add_argument("--warn-lines", type=int)
 
@@ -577,6 +577,7 @@ def main() -> int:
         elif args.command == "packet-lint":
             result = analyze_packet(
                 parse_packet(_read_text(args.body_file)),
+                profile_root=args.root,
                 warn_chars=args.warn_chars,
                 warn_lines=args.warn_lines,
             )
